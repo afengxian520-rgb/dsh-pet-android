@@ -818,7 +818,7 @@ jobs:
           )
           patch(
               "app/src/main/java/com/dshpet/android/MainActivity.kt",
-              '    /** 显示当前生效的台词库来源与条数 */\n',
+              '/** 显示当前生效的台词库来源与条数 */\n',,
               '''    private fun refreshLandscapeButton() {
               val enabled = Prefs.landscapeVisibleOnLandscape(this)
               btnLandscape.text = getString(
