@@ -31,16 +31,48 @@ jobs:
         run: |
           set -euo pipefail
           FILE="app/src/main/res/layout/activity_main.xml"
-          if [ ! -f "$FILE" ]; then
-            echo "找不到 $FILE；请检查仓库根目录结构。"
-            exit 1
-          fi
+          test -f "$FILE"
           sed -i \
             -e 's/@drawable\/whale_selfie/@drawable\/ic_launcher/g' \
             -e 's/@drawable\/whale_cutout/@drawable\/ic_launcher/g' \
             "$FILE"
-          echo "Remaining whale drawable references:"
-          grep -nE '@drawable/whale_(selfie|cutout)' "$FILE" || true
+
+      - name: Generate missing sound resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/res/raw
+          python3 - <<'PY'
+          import math
+          import struct
+          import wave
+          from pathlib import Path
+
+          output = Path("app/src/main/res/raw")
+          output.mkdir(parents=True, exist_ok=True)
+
+          for name, frequency, duration in [
+              ("tap_press", 520, 0.05),
+              ("tap_release", 880, 0.06),
+          ]:
+              target = output / f"{name}.wav"
+              if target.exists():
+                  continue
+              rate = 22050
+              count = int(rate * duration)
+              frames = bytearray()
+              for i in range(count):
+                  t = i / rate
+                  envelope = math.exp(-65 * t) * (1 - i / count)
+                  sample = int(6500 * envelope * math.sin(2 * math.pi * frequency * t))
+                  frames.extend(struct.pack("<h", sample))
+              with wave.open(str(target), "wb") as wav:
+                  wav.setnchannels(1)
+                  wav.setsampwidth(2)
+                  wav.setframerate(rate)
+                  wav.writeframes(frames)
+              print(f"Created {target}")
+          PY
 
       - name: Build debug APK
         shell: bash
