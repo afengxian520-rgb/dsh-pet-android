@@ -23,14 +23,17 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK (avoid removed tools package)
         uses: android-actions/setup-android@v4
         with:
+          # Explicitly avoid Google's removed legacy "tools" SDK package.
           packages: 'platform-tools'
 
       - name: Install Android 34 build platform
         shell: bash
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -1083,7 +1086,7 @@ jobs:
           )
           patch(
               "app/src/main/java/com/dshpet/android/MainActivity.kt",
-              '        // 碎碎念开关\n',
+              '    // 碎碎念开关\n',
               '''        btnProactive.setOnClickListener {
                   val enabled = !Prefs.proactiveOn(this)
                   Prefs.setProactiveOn(this, enabled)
@@ -1936,7 +1939,7 @@ jobs:
           )
           patch(
               "app/src/main/java/com/dshpet/android/MainActivity.kt",
-              '        // 碎碎念开关\n',
+              '    // 碎碎念开关\n',
               '''        btnCompanion.setOnClickListener {
                   startActivity(Intent(this, LocalCompanionActivity::class.java))
                   Sfx.press()
