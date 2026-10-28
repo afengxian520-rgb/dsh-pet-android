@@ -1,0 +1,2481 @@
+name: Build Android APK - v1.8.5 Offline Companion (LayoutParams Fix v2)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK (current command-line tools; no legacy tools package)
+        uses: android-actions/setup-android@v4
+        with:
+          # Use the current official command-line tools revision. Do not request the retired "tools" package.
+          cmdline-tools-version: 15859902
+          packages: 'platform-tools'
+          # The action reads this with getBooleanInput(): only true/false are valid ('yes' makes the step fail).
+          accept-android-sdk-licenses: 'true'
+
+      - name: Install Android 34 build platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore original whale art and 106 animation assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APK_SOURCE="/tmp/dsh-pet-v1.8.1-480p-24fps.apk"
+          RELEASE_META="/tmp/dsh-pet-v1.8.1-release-metadata.json"
+          RELEASE_API="https://api.github.com/repos/Tony-Chen-Stark/dsh-pet-android/releases/tags/v1.8.1"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "$RELEASE_API" --output "$RELEASE_META"
+          python3 - "$RELEASE_META" "$APK_SOURCE" <<'PY_ASSET_DOWNLOAD'
+          import hashlib
+          import json
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          metadata_path = Path(sys.argv[1])
+          target = Path(sys.argv[2])
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          asset_name = "dsh-pet-v1.8.1-480p-24fps.apk"
+          assets = [asset for asset in metadata.get("assets", []) if asset.get("name") == asset_name]
+          if len(assets) != 1:
+              raise SystemExit(f"Release metadata must contain exactly one {asset_name!r}; found {len(assets)}")
+          asset = assets[0]
+          digest_field = asset.get("digest") or ""
+          if not digest_field.startswith("sha256:"):
+              raise SystemExit(f"GitHub Release API did not provide a SHA-256 digest for {asset_name}; refusing a download that cannot be verified")
+          expected_sha = digest_field.split(":", 1)[1].lower()
+          if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
+              raise SystemExit(f"Invalid SHA-256 digest returned by GitHub Release API: {digest_field!r}")
+          expected_size = int(asset.get("size", 0))
+          if expected_size < 10_000_000:
+              raise SystemExit(f"Unexpected release asset size {expected_size}; refusing a wrong or partial asset")
+          download_url = asset.get("browser_download_url")
+          if not download_url or not download_url.startswith("https://github.com/Tony-Chen-Stark/dsh-pet-android/releases/download/"):
+              raise SystemExit(f"Unexpected release asset download URL: {download_url!r}")
+          print(f"Pinned asset: {asset_name}; asset id={asset.get('id')}; expected bytes={expected_size}")
+          print(f"Verifying against the SHA-256 published by GitHub Release API: {expected_sha}")
+          for attempt in range(1, 4):
+              target.unlink(missing_ok=True)
+              result = subprocess.run([
+                  "curl", "--fail", "--location", "--retry", "3", "--retry-delay", "2",
+                  "--retry-all-errors", download_url, "--output", str(target)
+              ], check=False)
+              if result.returncode == 0 and target.is_file():
+                  actual_size = target.stat().st_size
+                  h = hashlib.sha256()
+                  with target.open("rb") as downloaded:
+                      for chunk in iter(lambda: downloaded.read(1024 * 1024), b""):
+                          h.update(chunk)
+                  actual_sha = h.hexdigest()
+                  if actual_size == expected_size and actual_sha == expected_sha:
+                      print(f"Asset integrity verified on attempt {attempt}: bytes={actual_size}; sha256={actual_sha}")
+                      break
+                  print(f"Attempt {attempt}/3 mismatched authoritative metadata: size={actual_size}/{expected_size}; sha256={actual_sha}/{expected_sha}", file=sys.stderr)
+              else:
+                  print(f"Attempt {attempt}/3 failed to download the asset (curl exit={result.returncode})", file=sys.stderr)
+              target.unlink(missing_ok=True)
+              if attempt < 3:
+                  time.sleep(attempt * 2)
+          else:
+              raise SystemExit("Release APK did not match published GitHub SHA-256/size after 3 attempts; refusing to extract unverified assets")
+          PY_ASSET_DOWNLOAD
+          python3 - <<'PY_ASSETS'
+          import zipfile
+          from pathlib import Path
+
+          source = Path('/tmp/dsh-pet-v1.8.1-480p-24fps.apk')
+          root = Path('.')
+          webp_dir = root / 'app/src/main/assets/webp'
+          webp_dir.mkdir(parents=True, exist_ok=True)
+          for old in webp_dir.glob('*.webp'):
+              old.unlink()
+          expected = {f'a{i:03d}.webp' for i in range(1, 107)}
+          with zipfile.ZipFile(source) as apk:
+              assets = {
+                  Path(name).name: name
+                  for name in apk.namelist()
+                  if name.startswith('assets/webp/') and name.endswith('.webp')
+              }
+              if set(assets) != expected:
+                  raise SystemExit(
+                      f'Animation asset mismatch: got {len(assets)}; '
+                      f'missing={sorted(expected-set(assets))}; extra={sorted(set(assets)-expected)}'
+                  )
+              for filename in sorted(expected):
+                  data = apk.read(assets[filename])
+                  if not data:
+                      raise SystemExit(f'Empty animation: {filename}')
+                  (webp_dir / filename).write_bytes(data)
+              drawables = {
+                  'res/drawable-nodpi-v4/whale_selfie.png': root / 'app/src/main/res/drawable-nodpi/whale_selfie.png',
+                  'res/drawable/whale_cutout.png': root / 'app/src/main/res/drawable/whale_cutout.png',
+              }
+              for internal, target in drawables.items():
+                  try:
+                      data = apk.read(internal)
+                  except KeyError:
+                      raise SystemExit(f'Missing original artwork in source APK: {internal}')
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+          print(f'Restored {len(expected)} animation WebPs and original whale illustrations.')
+          PY_ASSETS
+
+      - name: Add birthday greeting and celebration feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path, before, after, marker):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if marker in text:
+                  print(f"Already patched: {path}")
+                  return
+              if before not in text:
+                  raise SystemExit(f"Cannot patch {path}; source anchor not found: {before[:90]!r}")
+              p.write_text(text.replace(before, after, 1), encoding="utf-8")
+              print(f"Patched: {path}")
+
+          # Settings page: birthday date, reminder time, save, clear and test buttons.
+          patch(
+              "app/src/main/res/layout/activity_main.xml",
+              "            <!-- 台词库：用户可以自己改 -->",
+              '''            <!-- 生日祝福与庆祝表演 -->
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="16dp"
+                  android:background="@drawable/bg_card"
+                  android:orientation="vertical"
+                  android:padding="16dp">
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/birthday_title"
+                      android:textColor="@color/text"
+                      android:textSize="15sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:text="@string/birthday_hint"
+                      android:textColor="@color/text_dim"
+                      android:textSize="12sp" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:orientation="horizontal">
+
+                      <TextView
+                          android:id="@+id/birthdayDate"
+                          android:layout_width="0dp"
+                          android:layout_height="48dp"
+                          android:layout_marginEnd="5dp"
+                          android:layout_weight="1"
+                          android:background="@drawable/bg_btn_ghost"
+                          android:clickable="true"
+                          android:focusable="true"
+                          android:gravity="center"
+                          android:text="@string/birthday_choose_date"
+                          android:textColor="@color/text_sub"
+                          android:textSize="13sp" />
+
+                      <TextView
+                          android:id="@+id/birthdayTime"
+                          android:layout_width="0dp"
+                          android:layout_height="48dp"
+                          android:layout_marginStart="5dp"
+                          android:layout_weight="1"
+                          android:background="@drawable/bg_btn_ghost"
+                          android:clickable="true"
+                          android:focusable="true"
+                          android:gravity="center"
+                          android:text="@string/birthday_time_default"
+                          android:textColor="@color/text_sub"
+                          android:textSize="13sp" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="10dp"
+                      android:orientation="horizontal">
+
+                      <TextView
+                          android:id="@+id/btnBirthdaySave"
+                          android:layout_width="0dp"
+                          android:layout_height="46dp"
+                          android:layout_marginEnd="5dp"
+                          android:layout_weight="1"
+                          android:background="@drawable/bg_btn_primary"
+                          android:clickable="true"
+                          android:focusable="true"
+                          android:gravity="center"
+                          android:text="@string/birthday_save"
+                          android:textColor="#FFFFFF"
+                          android:textSize="13sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/btnBirthdayTest"
+                          android:layout_width="0dp"
+                          android:layout_height="46dp"
+                          android:layout_marginStart="5dp"
+                          android:layout_weight="1"
+                          android:background="@drawable/bg_btn_ghost"
+                          android:clickable="true"
+                          android:focusable="true"
+                          android:gravity="center"
+                          android:text="@string/birthday_test"
+                          android:textColor="@color/text_sub"
+                          android:textSize="13sp" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/btnBirthdayClear"
+                      android:layout_width="match_parent"
+                      android:layout_height="40dp"
+                      android:layout_marginTop="4dp"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:gravity="center"
+                      android:text="@string/birthday_clear"
+                      android:textColor="@color/text_dim"
+                      android:textSize="12sp" />
+              </LinearLayout>
+
+            <!-- 台词库：用户可以自己改 -->''',
+              "@+id/btnBirthdayTest",
+          )
+
+          # UI strings.
+          patch(
+              "app/src/main/res/values/strings.xml",
+              "</resources>",
+              '''    <string name="birthday_title">🎂 生日祝福与表演</string>
+              <string name="birthday_hint">每年生日当天，大肥鱼会在设定时间送上祝福，并跳一段庆祝舞。要尽量准时，可按提示允许“闹钟和提醒”；未授权时仍会尝试提醒，但系统省电可能延迟。</string>
+              <string name="birthday_choose_date">选择生日日期</string>
+              <string name="birthday_date_value">生日：%1$d月%2$d日</string>
+              <string name="birthday_time_default">祝福时间：09:00</string>
+              <string name="birthday_time_value">祝福时间：%1$02d:%2$02d</string>
+              <string name="birthday_save">保存生日安排</string>
+              <string name="birthday_test">立即试演</string>
+              <string name="birthday_clear">清除生日安排</string>
+              <string name="birthday_pick_date_first">请先选择生日日期。</string>
+              <string name="birthday_saved">已安排每年 %1$d月%2$d日 %3$02d:%4$02d 送上祝福。</string>
+              <string name="birthday_cleared">生日安排已清除。</string>
+              <string name="birthday_test_need_pet">请先授权悬浮窗并点击“放出来”，再试演。</string>
+              <string name="birthday_test_started">大肥鱼开始试演祝福啦！</string>
+
+          </resources>''',
+              'name="birthday_title"',
+          )
+
+          # PetService: manual test and birthday alarm share the same performance action.
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '        const val ACTION_LINES = "com.dshpet.android.action.LINES"\n',
+              '''        const val ACTION_LINES = "com.dshpet.android.action.LINES"
+              const val ACTION_BIRTHDAY = "com.dshpet.android.action.BIRTHDAY"
+
+              /** Called by the birthday alarm or the settings-page test button. */
+              fun celebrateNow(ctx: Context) {
+                  val i = Intent(ctx, PetService::class.java).setAction(ACTION_BIRTHDAY)
+                  try {
+                      // The pet service normally keeps running; a plain start also works from the alarm receiver.
+                      ctx.startService(i)
+                  } catch (_: Throwable) {
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                          else ctx.startService(i)
+                      } catch (t: Throwable) {
+                          Diag.record(ctx, "启动生日表演失败", t)
+                      }
+                  }
+              }
+          ''',
+              "const val ACTION_BIRTHDAY =",
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              "                else -> {\n                    if (held.isEmpty()) spawnAll(Prefs.sizeDp(this))\n                }\n",
+              "                ACTION_BIRTHDAY -> {\n                    val alreadyVisible = held.isNotEmpty()\n                    if (!alreadyVisible && Settings.canDrawOverlays(this)) {\n                        spawnAll(Prefs.sizeDp(this))\n                    }\n                    // Delay birthday speech so the generic startup greeting does not replace it.\n                    handler.postDelayed({ birthdayCelebration() }, if (alreadyVisible) 300L else 1900L)\n                }\n                else -> {\n                    if (held.isEmpty()) spawnAll(Prefs.sizeDp(this))\n                }\n",
+              "ACTION_BIRTHDAY ->",
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              "    // ------------------------------------------------------------ 帧循环\n",
+              '''    /** 生日当天：送上专属祝福，并播放现有的庆祝舞动画。 */
+              private fun birthdayCelebration() {
+                  try {
+                      val pet = held.firstOrNull()?.pet ?: return
+                      lastInteractMs = SystemClock.uptimeMillis()
+                      say(pet, "主人，生日快乐！🎂 今天你最大！大肥鱼特地为你跳一段庆祝舞，愿你每天开心、愿望都实现！")
+                      val action = listOf("a103", "a026", "a057").firstOrNull { cfg?.names?.containsKey(it) == true }
+                      if (action != null) pet.playAction(action)
+                      else Diag.record(this, "生日庆祝动画未找到，已发送文字祝福")
+                  } catch (t: Throwable) {
+                      Diag.record(this, "生日祝福/表演失败", t)
+                  }
+              }
+
+              // ------------------------------------------------------------ 帧循环
+          ''',
+              "private fun birthdayCelebration()",
+          )
+
+          # Annual birthday scheduler. It reschedules after every alarm and handles Feb 29.
+          Path("app/src/main/java/com/dshpet/android/BirthdaySchedule.kt").write_text(r'''package com.dshpet.android
+
+          import android.app.AlarmManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.provider.Settings
+          import java.util.Calendar
+
+          /** Annual local birthday reminder. System power saving may delay it by a few minutes. */
+          object BirthdaySchedule {
+              const val ACTION_BIRTHDAY = "com.dshpet.android.action.BIRTHDAY_ALARM"
+              private const val PREFS = "dsh_pet_birthday"
+              private const val KEY_MONTH = "month"
+              private const val KEY_DAY = "day"
+              private const val KEY_HOUR = "hour"
+              private const val KEY_MINUTE = "minute"
+              private const val KEY_ENABLED = "enabled"
+              private const val REQUEST_CODE = 8217
+              private const val CHANNEL_ID = "dsh_pet_birthday"
+              private const val NOTIFICATION_ID = 8217
+
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+              fun month(ctx: Context): Int = prefs(ctx).getInt(KEY_MONTH, 0)
+              fun day(ctx: Context): Int = prefs(ctx).getInt(KEY_DAY, 0)
+              fun hour(ctx: Context): Int = prefs(ctx).getInt(KEY_HOUR, 9).coerceIn(0, 23)
+              fun minute(ctx: Context): Int = prefs(ctx).getInt(KEY_MINUTE, 0).coerceIn(0, 59)
+
+              fun hasBirthday(ctx: Context): Boolean =
+                  prefs(ctx).getBoolean(KEY_ENABLED, false) && month(ctx) in 1..12 && day(ctx) in 1..31
+
+              fun set(ctx: Context, month: Int, day: Int, hour: Int, minute: Int) {
+                  require(month in 1..12 && day in 1..31 && hour in 0..23 && minute in 0..59) {
+                      "无效的生日日期或时间"
+                  }
+                  val valid = if (month == 2 && day == 29) true else try {
+                      Calendar.getInstance().apply {
+                          clear()
+                          isLenient = false
+                          set(2001, month - 1, day, 12, 0, 0)
+                      }.timeInMillis
+                      true
+                  } catch (_: Throwable) { false }
+                  require(valid) { "无效的生日日期" }
+                  prefs(ctx).edit()
+                      .putInt(KEY_MONTH, month).putInt(KEY_DAY, day)
+                      .putInt(KEY_HOUR, hour).putInt(KEY_MINUTE, minute)
+                      .putBoolean(KEY_ENABLED, true).apply()
+                  schedule(ctx)
+              }
+
+              fun clear(ctx: Context) {
+                  cancel(ctx)
+                  prefs(ctx).edit().putBoolean(KEY_ENABLED, false)
+                      .putInt(KEY_MONTH, 0).putInt(KEY_DAY, 0).apply()
+              }
+
+              fun schedule(ctx: Context) {
+                  if (!hasBirthday(ctx)) { cancel(ctx); return }
+                  val alarms = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+                  val pending = alarmPendingIntent(ctx)
+                  val triggerAt = nextOccurrence(month(ctx), day(ctx), hour(ctx), minute(ctx)).timeInMillis
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                          if (alarms.canScheduleExactAlarms()) {
+                          alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
+                          } else {
+                          alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
+                          }
+                      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                          alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
+                      } else {
+                          alarms.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pending)
+                      }
+                  } catch (_: Throwable) { }
+              }
+
+              private fun cancel(ctx: Context) {
+                  try {
+                      (ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager)?.cancel(alarmPendingIntent(ctx))
+                  } catch (_: Throwable) { }
+              }
+
+              private fun alarmPendingIntent(ctx: Context): PendingIntent = PendingIntent.getBroadcast(
+                  ctx, REQUEST_CODE,
+                  Intent(ctx, BirthdayReceiver::class.java).setAction(ACTION_BIRTHDAY),
+                  PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+              )
+
+              private fun nextOccurrence(month: Int, day: Int, hour: Int, minute: Int): Calendar {
+                  val now = System.currentTimeMillis()
+                  val startYear = Calendar.getInstance().get(Calendar.YEAR)
+                  for (year in startYear..(startYear + 12)) {
+                      try {
+                          val candidate = Calendar.getInstance().apply {
+                              clear()
+                              isLenient = false
+                              set(year, month - 1, day, hour, minute, 0)
+                              set(Calendar.MILLISECOND, 0)
+                          }
+                          if (candidate.timeInMillis > now) return candidate
+                      } catch (_: Throwable) { /* February 29 on a non-leap year: try the next year. */ }
+                  }
+                  return Calendar.getInstance().apply { add(Calendar.YEAR, 1) }
+              }
+
+              fun showNotification(ctx: Context) {
+                  try {
+                      val manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager.getNotificationChannel(CHANNEL_ID) == null) {
+                          manager.createNotificationChannel(NotificationChannel(
+                              CHANNEL_ID, "大肥鱼生日祝福", NotificationManager.IMPORTANCE_HIGH,
+                          ).apply { description = "生日当天的大肥鱼祝福与表演提醒" })
+                      }
+                      val open = PendingIntent.getActivity(
+                          ctx, REQUEST_CODE, Intent(ctx, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                      )
+                      val notification = Notification.Builder(ctx, CHANNEL_ID)
+                          .setSmallIcon(R.drawable.ic_launcher)
+                          .setContentTitle("主人，生日快乐！🎂")
+                          .setContentText("大肥鱼准备了生日祝福和庆祝表演，点开看看吧。")
+                          .setStyle(Notification.BigTextStyle().bigText(
+                              "主人，生日快乐！大肥鱼准备了专属祝福和庆祝舞。愿你新的一岁开心顺利、心愿成真！"
+                          ))
+                          .setContentIntent(open).setAutoCancel(true)
+                          .setWhen(System.currentTimeMillis()).build()
+                      manager.notify(NOTIFICATION_ID, notification)
+                  } catch (_: SecurityException) {
+                      // If Android 13+ notification permission was declined, the pet can still perform the animation.
+                  } catch (_: Throwable) { }
+              }
+          }
+
+          class BirthdayReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent?) {
+                  if (intent?.action != BirthdaySchedule.ACTION_BIRTHDAY) return
+                  BirthdaySchedule.schedule(context) // Schedule the next year immediately.
+                  BirthdaySchedule.showNotification(context)
+                  if (Prefs.running(context) && Settings.canDrawOverlays(context)) {
+                      PetService.celebrateNow(context)
+                  }
+              }
+          }
+          ''', encoding="utf-8")
+
+          # Ask for exact-alarm special access; keep a safe inexact fallback when denied.
+          patch(
+              "app/src/main/AndroidManifest.xml",
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />',
+              'android.permission.SCHEDULE_EXACT_ALARM',
+          )
+
+          # Register alarm receiver and reschedule after reboot or time-zone changes.
+          patch(
+              "app/src/main/AndroidManifest.xml",
+              "        <receiver\n            android:name=\".BootReceiver\"\n            android:exported=\"true\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.BOOT_COMPLETED\" />\n                <action android:name=\"android.intent.action.MY_PACKAGE_REPLACED\" />\n            </intent-filter>\n        </receiver>",
+              '''        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
+            </intent-filter>
+          </receiver>
+
+          <receiver
+            android:name=".BirthdayReceiver"
+            android:exported="false" />''',
+              'android:name=".BirthdayReceiver"',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/BootReceiver.kt",
+              '        val action = intent?.action ?: return\n        if (action != Intent.ACTION_BOOT_COMPLETED && action != Intent.ACTION_MY_PACKAGE_REPLACED) return\n',
+              '        val action = intent?.action ?: return\n        BirthdaySchedule.schedule(ctx)\n        if (action != Intent.ACTION_BOOT_COMPLETED &&\n            action != Intent.ACTION_MY_PACKAGE_REPLACED\n        ) return\n',
+              'BirthdaySchedule.schedule(ctx)',
+          )
+
+          # MainActivity imports and settings-page logic.
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              'import android.app.Activity\n',
+              'import android.app.Activity\nimport android.app.AlertDialog\nimport android.app.AlarmManager\nimport android.app.DatePickerDialog\nimport android.app.TimePickerDialog\n',
+              'import android.app.DatePickerDialog',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              'import android.widget.TextView\n',
+              'import android.widget.TextView\nimport java.util.Calendar\n',
+              'import java.util.Calendar',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    private lateinit var btnLinesReload: TextView\n',
+              '''    private lateinit var btnLinesReload: TextView
+              private lateinit var birthdayDate: TextView
+              private lateinit var birthdayTime: TextView
+              private lateinit var btnBirthdaySave: TextView
+              private lateinit var btnBirthdayTest: TextView
+              private lateinit var btnBirthdayClear: TextView
+              private var birthdayMonth = 0
+              private var birthdayDay = 0
+              private var birthdayHour = 9
+              private var birthdayMinute = 0
+          ''',
+              'private lateinit var birthdayDate',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        findViewById<TextView>(R.id.btnStart).setOnClickListener {',
+              '''        birthdayDate = findViewById(R.id.birthdayDate)
+              birthdayTime = findViewById(R.id.birthdayTime)
+              btnBirthdaySave = findViewById(R.id.btnBirthdaySave)
+              btnBirthdayTest = findViewById(R.id.btnBirthdayTest)
+              btnBirthdayClear = findViewById(R.id.btnBirthdayClear)
+              birthdayMonth = BirthdaySchedule.month(this)
+              birthdayDay = BirthdaySchedule.day(this)
+              birthdayHour = BirthdaySchedule.hour(this)
+              birthdayMinute = BirthdaySchedule.minute(this)
+              refreshBirthdayLabels()
+
+              birthdayDate.setOnClickListener {
+                  val now = Calendar.getInstance()
+                  val currentYear = now.get(Calendar.YEAR)
+                  // Show a leap year in the picker so February 29 remains selectable even in non-leap years.
+                  val year = (currentYear..(currentYear + 8)).firstOrNull { candidate ->
+                      candidate % 400 == 0 || (candidate % 4 == 0 && candidate % 100 != 0)
+                  } ?: currentYear
+                  val month = if (birthdayMonth in 1..12) birthdayMonth - 1 else now.get(Calendar.MONTH)
+                  val day = if (birthdayDay in 1..31) birthdayDay else now.get(Calendar.DAY_OF_MONTH)
+                  DatePickerDialog(this, { _, _, monthOfYear, dayOfMonth ->
+                      birthdayMonth = monthOfYear + 1
+                      birthdayDay = dayOfMonth
+                      refreshBirthdayLabels()
+                  }, year, month, day).show()
+              }
+              birthdayTime.setOnClickListener {
+                  TimePickerDialog(this, { _, hourOfDay, minuteOfHour ->
+                      birthdayHour = hourOfDay
+                      birthdayMinute = minuteOfHour
+                      refreshBirthdayLabels()
+                  }, birthdayHour, birthdayMinute, true).show()
+              }
+              btnBirthdaySave.setOnClickListener {
+                  if (birthdayMonth !in 1..12 || birthdayDay !in 1..31) {
+                      Toast.makeText(this, getString(R.string.birthday_pick_date_first), Toast.LENGTH_SHORT).show()
+                      return@setOnClickListener
+                  }
+                  try {
+                      BirthdaySchedule.set(this, birthdayMonth, birthdayDay, birthdayHour, birthdayMinute)
+                      Toast.makeText(this,
+                          getString(R.string.birthday_saved, birthdayMonth, birthdayDay, birthdayHour, birthdayMinute),
+                          Toast.LENGTH_LONG).show()
+                  } catch (t: Throwable) {
+                      Diag.record(this, "保存生日安排失败", t)
+                      Toast.makeText(this, getString(R.string.birthday_pick_date_first), Toast.LENGTH_SHORT).show()
+                  }
+              }
+              btnBirthdayTest.setOnClickListener {
+                  if (!Prefs.running(this) || !Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, getString(R.string.birthday_test_need_pet), Toast.LENGTH_LONG).show()
+                  } else {
+                      PetService.celebrateNow(this)
+                      Toast.makeText(this, getString(R.string.birthday_test_started), Toast.LENGTH_SHORT).show()
+                  }
+              }
+              btnBirthdayClear.setOnClickListener {
+                  BirthdaySchedule.clear(this)
+                  birthdayMonth = 0
+                  birthdayDay = 0
+                  refreshBirthdayLabels()
+                  Toast.makeText(this, getString(R.string.birthday_cleared), Toast.LENGTH_SHORT).show()
+              }
+
+              findViewById<TextView>(R.id.btnStart).setOnClickListener {''',
+              'btnBirthdaySave.setOnClickListener',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '            Toast.makeText(this,\n                getString(R.string.birthday_saved, birthdayMonth, birthdayDay, birthdayHour, birthdayMinute),\n                Toast.LENGTH_LONG).show()\n        } catch (t: Throwable) {',
+              '''            Toast.makeText(this,
+                getString(R.string.birthday_saved, birthdayMonth, birthdayDay, birthdayHour, birthdayMinute),
+                Toast.LENGTH_LONG).show()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val alarms = getSystemService(AlarmManager::class.java)
+                if (alarms != null && !alarms.canScheduleExactAlarms()) {
+                    AlertDialog.Builder(this)
+                        .setTitle("生日提醒尽量准时")
+                        .setMessage("允许“闹钟和提醒”特殊访问后，生日提醒会尽量按设定时间触发。若暂时不授权，仍会尝试提醒，但系统省电可能让时间延后。")
+                        .setNegativeButton("稍后", null)
+                        .setPositiveButton("打开设置") { _, _ ->
+                            try {
+                                startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
+                            } catch (t: Throwable) {
+                                Diag.record(this, "打开精确闹钟设置失败", t)
+                            }
+                        }
+                        .show()
+                }
+            }
+          } catch (t: Throwable) {''',
+              '生日闹钟授权提示',
+          )
+
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    /** 显示当前生效的台词库来源与条数 */\n',
+              '''    private fun refreshBirthdayLabels() {
+              birthdayDate.text = if (birthdayMonth in 1..12 && birthdayDay in 1..31) {
+                  getString(R.string.birthday_date_value, birthdayMonth, birthdayDay)
+              } else {
+                  getString(R.string.birthday_choose_date)
+              }
+              birthdayTime.text = getString(R.string.birthday_time_value, birthdayHour, birthdayMinute)
+          }
+
+          /** 显示当前生效的台词库来源与条数 */
+          ''',
+              'private fun refreshBirthdayLabels()',
+          )
+
+          # Bump visible app version for the feature build.
+          p = Path("app/build.gradle.kts")
+          gradle = p.read_text(encoding="utf-8")
+          if 'versionName = "1.8.2"' not in gradle:
+              if 'versionCode = 12\n        versionName = "1.8.1"' not in gradle:
+                  raise SystemExit("Cannot patch app/build.gradle.kts version")
+              gradle = gradle.replace('versionCode = 12\n        versionName = "1.8.1"',
+                                      'versionCode = 13\n        versionName = "1.8.2"', 1)
+              p.write_text(gradle, encoding="utf-8")
+          print("Birthday feature patch complete")
+          PY
+
+      - name: Add landscape auto-hide and 10-pet limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_LANDSCAPE'
+          from pathlib import Path
+
+          def patch(path, before, after, marker):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if marker in text:
+                  print(f"Already patched: {path}")
+                  return
+              if before not in text:
+                  raise SystemExit(f"Cannot patch {path}; source anchor not found: {before[:90]!r}")
+              p.write_text(text.replace(before, after, 1), encoding="utf-8")
+              print(f"Patched: {path}")
+
+          # Local preference: default false means hide pets in landscape; true lets them remain visible.
+          patch(
+              "app/src/main/java/com/dshpet/android/Prefs.kt",
+              '    private const val KEY_EDGE_HIDE = "edge_hide"\n',
+              '    private const val KEY_EDGE_HIDE = "edge_hide"\n    private const val KEY_LANDSCAPE_VISIBLE = "landscape_visible"\n    private const val KEY_PROACTIVE = "proactive_on"\n',
+              'KEY_LANDSCAPE_VISIBLE',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/Prefs.kt",
+              '    const val MAX_PETS = 3',
+              '    const val MAX_PETS = 10',
+              'const val MAX_PETS = 10',
+          )
+          patch(
+              "app/src/main/res/values/strings.xml",
+              '    <string name="pets_title">桌宠只数</string>',
+              '    <string name="pets_title">桌宠只数（多只自动缩小以避免重叠）</string>',
+              '多只自动缩小以避免重叠',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/Prefs.kt",
+              '\n}',
+              '''
+
+              /** By default, desktop pets hide while the device is in landscape. */
+              fun landscapeVisibleOnLandscape(ctx: Context): Boolean =
+                  sp(ctx).getBoolean(KEY_LANDSCAPE_VISIBLE, false)
+
+              fun setLandscapeVisibleOnLandscape(ctx: Context, enabled: Boolean) {
+                  sp(ctx).edit().putBoolean(KEY_LANDSCAPE_VISIBLE, enabled).apply()
+              }
+
+              /** Controls local proactive companion messages and social-app reminder bubbles. */
+              fun proactiveOn(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_PROACTIVE, true)
+
+              fun setProactiveOn(ctx: Context, enabled: Boolean) {
+                  sp(ctx).edit().putBoolean(KEY_PROACTIVE, enabled).apply()
+              }
+
+          }''',
+              'fun landscapeVisibleOnLandscape',
+          )
+
+          # Usage Access allows distinguishing an external landscape app from the launcher.
+          patch(
+              "app/src/main/AndroidManifest.xml",
+              '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n',
+              '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />\n',
+              'android.permission.PACKAGE_USAGE_STATS',
+          )
+
+          # Add the switch on the existing settings page without removing other controls.
+          patch(
+              "app/src/main/res/layout/activity_main.xml",
+              '            <!-- 后台保活：清后台时不容易误杀 -->',
+              '''            <!-- 横屏行为：默认自动收起，用户可切换为横屏也显示 -->
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:background="@drawable/bg_card"
+                  android:orientation="vertical"
+                  android:padding="16dp">
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/landscape_title"
+                      android:textColor="@color/text"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:text="@string/landscape_hint"
+                      android:textColor="@color/text_dim"
+                      android:textSize="12sp" />
+
+                  <TextView
+                      android:id="@+id/btnLandscape"
+                      android:layout_width="match_parent"
+                      android:layout_height="44dp"
+                      android:layout_marginTop="10dp"
+                      android:background="@drawable/bg_chip_off"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:gravity="center"
+                      android:text="@string/landscape_mode_off"
+                      android:textColor="@color/chip_off_text"
+                      android:textSize="13sp" />
+
+                  <TextView
+                      android:id="@+id/btnUsageAccess"
+                      android:layout_width="match_parent"
+                      android:layout_height="42dp"
+                      android:layout_marginTop="8dp"
+                      android:background="@drawable/bg_btn_ghost"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:gravity="center"
+                      android:text="@string/landscape_usage_access"
+                      android:textColor="@color/text_sub"
+                      android:textSize="13sp" />
+              </LinearLayout>
+
+              <!-- 后台保活：清后台时不容易误杀 -->''',
+              '@+id/btnLandscape',
+          )
+
+          patch(
+              "app/src/main/res/values/strings.xml",
+              '</resources>',
+              '''    <string name="landscape_title">横屏时如何显示桌宠</string>
+              <string name="landscape_hint">默认：横屏应用在前台时收起，回到桌面后恢复。开启后横屏也显示桌宠。要在手机仍横着时识别返回桌面，请授权前台应用识别；未授权时按设备横竖屏切换。</string>
+              <string name="landscape_usage_access">授权前台应用识别（系统设置）</string>
+              <string name="landscape_mode_on">横屏继续显示：已开启</string>
+              <string name="landscape_mode_off">横屏继续显示：已关闭（自动收起）</string>
+
+          </resources>''',
+              'name="landscape_mode_on"',
+          )
+
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    private lateinit var btnPets: TextView\n',
+              '    private lateinit var btnPets: TextView\n    private lateinit var btnLandscape: TextView\n    private lateinit var btnUsageAccess: TextView\n',
+              'private lateinit var btnUsageAccess',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        btnPets = findViewById(R.id.btnPets)\n',
+              '        btnPets = findViewById(R.id.btnPets)\n        btnLandscape = findViewById(R.id.btnLandscape)\n        btnUsageAccess = findViewById(R.id.btnUsageAccess)\n',
+              'btnUsageAccess = findViewById',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        // 碎碎念开关\n',
+              '''        // 横屏行为开关：默认自动收起；打开后横屏仍显示。
+              btnLandscape.setOnClickListener {
+                  val enabled = !Prefs.landscapeVisibleOnLandscape(this)
+                  Prefs.setLandscapeVisibleOnLandscape(this, enabled)
+                  refreshLandscapeButton()
+                  Toast.makeText(
+                      this,
+                      getString(if (enabled) R.string.landscape_mode_on else R.string.landscape_mode_off),
+                      Toast.LENGTH_SHORT,
+                  ).show()
+              }
+
+              btnUsageAccess.setOnClickListener {
+                  try {
+                      startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                  } catch (t: Throwable) {
+                      Diag.record(this, "打开前台应用识别设置失败", t)
+                      Toast.makeText(this, getString(R.string.landscape_usage_access), Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              // 碎碎念开关
+              ''',
+              'btnLandscape.setOnClickListener',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '/** 显示当前生效的台词库来源与条数 */\n',
+              '''    private fun refreshLandscapeButton() {
+              val enabled = Prefs.landscapeVisibleOnLandscape(this)
+              btnLandscape.text = getString(
+                  if (enabled) R.string.landscape_mode_on else R.string.landscape_mode_off
+              )
+              btnLandscape.setBackgroundResource(
+                  if (enabled) R.drawable.bg_chip_ok else R.drawable.bg_chip_off
+              )
+              btnLandscape.setTextColor(
+                  Color.parseColor(if (enabled) "#6BE3B0" else "#B9A6FF")
+              )
+          }
+
+          /** 显示当前生效的台词库来源与条数 */
+          ''',
+              'private fun refreshLandscapeButton()',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        chipPets(Prefs.petCount(this))\n',
+              '        chipPets(Prefs.petCount(this))\n        refreshLandscapeButton()\n',
+              'chipPets(Prefs.petCount(this))\n        refreshLandscapeButton()\n',
+          )
+
+          # The foreground overlay service updates visibility while rotating, then restores it on portrait.
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'import android.app.Service\n',
+              'import android.app.Service\nimport android.app.AppOpsManager\nimport android.app.usage.UsageEvents\nimport android.app.usage.UsageStatsManager\n',
+              'import android.app.usage.UsageEvents',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'import android.content.Context\n',
+              'import android.content.Context\nimport android.content.res.Configuration\nimport android.content.pm.PackageManager\n',
+              'import android.content.res.Configuration',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'import android.os.Looper\n',
+              'import android.os.Looper\nimport android.os.Process\n',
+              'import android.os.Process',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '    private var tapWindowMs = 0L\n',
+              '    private var tapWindowMs = 0L\n    private var landscapeHidden = false\n    private var lastLandscapeCheckMs = 0L\n',
+              'private var lastLandscapeCheckMs = 0L',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '    // ------------------------------------------------------------ 帧循环\n',
+              '''    /** Hide only the overlay view in landscape; do not stop the service or destroy pet state. */
+              private var usageEventsLastQueryMs = 0L
+              private var usageEventsLoaded = false
+              private var foregroundPackageCache: String? = null
+
+              @Suppress("DEPRECATION")
+              private fun hasUsageAccess(): Boolean = try {
+                  val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+                  appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName) == AppOpsManager.MODE_ALLOWED
+              } catch (_: Throwable) { false }
+
+              private fun foregroundPackage(): String? {
+                  if (!hasUsageAccess()) return null
+                  return try {
+                      val now = System.currentTimeMillis()
+                      val begin = if (!usageEventsLoaded) now - 24L * 60L * 60L * 1000L
+                                  else (usageEventsLastQueryMs - 1000L).coerceAtLeast(now - 10L * 60L * 1000L)
+                      val manager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                      val events = manager.queryEvents(begin, now)
+                      val event = UsageEvents.Event()
+                      while (events.hasNextEvent()) {
+                          events.getNextEvent(event)
+                          val pkg = event.packageName ?: continue
+                          val type = event.eventType
+                          val resumed = type == UsageEvents.Event.MOVE_TO_FOREGROUND ||
+                              (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_RESUMED)
+                          val paused = type == UsageEvents.Event.MOVE_TO_BACKGROUND ||
+                              (Build.VERSION.SDK_INT >= 29 && (type == UsageEvents.Event.ACTIVITY_PAUSED || type == UsageEvents.Event.ACTIVITY_STOPPED))
+                          if (resumed) foregroundPackageCache = pkg
+                          else if (paused && foregroundPackageCache == pkg) foregroundPackageCache = null
+                      }
+                      usageEventsLoaded = true
+                      usageEventsLastQueryMs = now
+                      foregroundPackageCache
+                  } catch (t: Throwable) {
+                      Diag.record(this, "读取前台应用失败", t)
+                      null
+                  }
+              }
+
+              private fun isHomeOrOwnAppForeground(): Boolean {
+                  val current = foregroundPackage() ?: return false
+                  if (current == packageName) return true
+                  val home = try {
+                      packageManager.resolveActivity(
+                          Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+                          PackageManager.MATCH_DEFAULT_ONLY,
+                      )?.activityInfo?.packageName
+                  } catch (_: Throwable) { null }
+                  return current == home || current == "com.android.systemui"
+              }
+
+              private fun updateLandscapeVisibility() {
+                  val now = SystemClock.uptimeMillis()
+                  if (now - lastLandscapeCheckMs < 4000L) return
+                  lastLandscapeCheckMs = now
+                  val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                  val visibleInLandscape = Prefs.landscapeVisibleOnLandscape(this)
+                  val hasAccess = hasUsageAccess()
+                  val appIsForeground = if (hasAccess) isHomeOrOwnAppForeground() else false
+                  // When permission is granted, hide only for an external foreground app; otherwise use orientation-only fallback.
+                  val shouldHide = landscape && !visibleInLandscape && (if (hasAccess) !appIsForeground else true)
+                  if (shouldHide == landscapeHidden) return
+                  landscapeHidden = shouldHide
+                  for (h in held) {
+                      h.view.visibility = if (shouldHide) View.GONE else View.VISIBLE
+                  }
+                  if (shouldHide) {
+                      dismissBubble()
+                      dismissMenu()
+                  }
+                  Diag.record(this, if (shouldHide) "横屏应用前台：自动收起桌宠" else "返回桌面/竖屏/横屏显示开关：恢复桌宠")
+              }
+
+              // ------------------------------------------------------------ 帧循环
+              ''',
+              'private fun updateLandscapeVisibility()',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '            val n = SystemClock.uptimeMillis()\n            if (n - lastSpeechCheck > 1000L) {',
+              '''            val n = SystemClock.uptimeMillis()
+              try {
+                  updateLandscapeVisibility()
+              } catch (t: Throwable) {
+                  Diag.record(this@PetService, "横屏显隐更新失败", t)
+              }
+              if (n - lastSpeechCheck > 1000L) {''',
+              'updateLandscapeVisibility()\n              } catch (t: Throwable)',
+          )
+
+          # Precompute a cell layout. When many large pets are selected, scale them down
+          # to fit the grid rather than stacking the later pets on top of the first one.
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '        val count = Prefs.petCount(this).coerceIn(Prefs.MIN_PETS, Prefs.MAX_PETS)\n',
+              '        val count = Prefs.petCount(this).coerceIn(Prefs.MIN_PETS, Prefs.MAX_PETS)\n        val columns = if (count > 1 && dm.widthPixels >= dm.heightPixels) 5 else if (count > 1) 2 else 1\n        val rows = (count + columns - 1) / columns\n        val cellWidthDp = dm.widthPixels / dm.density / columns\n        val cellHeightDp = dm.heightPixels / dm.density / rows\n        val fitLimitDp = minOf(cellWidthDp, cellHeightDp).times(0.90f).toInt().coerceAtLeast(Prefs.MIN_SIZE_DP)\n        val effectiveSizeDp = if (count > 1) minOf(sizeDp, fitLimitDp) else sizeDp\n',
+              'val effectiveSizeDp = if (count > 1) minOf(sizeDp, fitLimitDp) else sizeDp',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '                pet.applyScale(sizeDp)',
+              '                pet.applyScale(effectiveSizeDp)',
+              'pet.applyScale(effectiveSizeDp)',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '                // 第二、三只错开放：一上一下，避免叠在一起，也别被推出屏幕\n                if (i > 0) {\n                    val up = if (i % 2 == 1) -1.0 else 1.0\n                    pet.shiftByVisible(\n                        up * 0.12 * pet.sizePx,\n                        up * 0.55 * pet.heightPx,\n                    )\n                }',
+              '                // Place each pet in the centre of a unique screen cell.\n                if (count > 1) {\n                    val column = i % columns\n                    val row = i / columns\n                    val cellWidthPx = dm.widthPixels.toDouble() / columns\n                    val cellHeightPx = dm.heightPixels.toDouble() / rows\n                    val targetX = (column * cellWidthPx + (cellWidthPx - pet.sizePx) / 2.0)\n                        .coerceIn(0.0, (dm.widthPixels - pet.sizePx).coerceAtLeast(0).toDouble())\n                    val targetY = (row * cellHeightPx + (cellHeightPx - pet.heightPx) / 2.0)\n                        .coerceIn(0.0, (dm.heightPixels - pet.heightPx).coerceAtLeast(0).toDouble())\n                    pet.shiftByVisible(targetX - pet.x, targetY - pet.y)\n                }',
+              'val targetX = (column * cellWidthPx',
+          )
+
+          # This workflow first applies birthday patch (1.8.2); mark this combined build as 1.8.3.
+          p = Path("app/build.gradle.kts")
+          gradle = p.read_text(encoding="utf-8")
+          if 'versionName = "1.8.3"' not in gradle:
+              if 'versionCode = 13\n        versionName = "1.8.2"' not in gradle:
+                  raise SystemExit("Cannot bump build to 1.8.3: birthday version was not applied")
+              gradle = gradle.replace('versionCode = 13\n        versionName = "1.8.2"',
+                                      'versionCode = 14\n        versionName = "1.8.3"', 1)
+              p.write_text(gradle, encoding="utf-8")
+          print("Landscape auto-hide, portrait restore, landscape display toggle, and 10-pet limit applied.")
+          PY_LANDSCAPE
+
+      - name: Add proactive companion, app-use reminders and midnight rest reminder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_REMINDERS'
+          from pathlib import Path
+
+          def patch(path, before, after, marker):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if marker in text:
+                  print(f"Already patched: {path}")
+                  return
+              if before not in text:
+                  raise SystemExit(f"Cannot patch {path}; source anchor not found: {before[:90]!r}")
+              p.write_text(text.replace(before, after, 1), encoding="utf-8")
+              print(f"Patched: {path}")
+
+          patch(
+              "app/src/main/res/layout/activity_main.xml",
+              '            <!-- 横屏行为：默认自动收起，用户可切换为横屏也显示 -->',
+              '''            <!-- 主动陪伴和应用使用提醒 -->
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:background="@drawable/bg_card"
+                  android:orientation="vertical"
+                  android:padding="16dp">
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/proactive_title"
+                      android:textColor="@color/text"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:text="@string/proactive_hint"
+                      android:textColor="@color/text_dim"
+                      android:textSize="12sp" />
+
+                  <TextView
+                      android:id="@+id/btnProactive"
+                      android:layout_width="match_parent"
+                      android:layout_height="44dp"
+                      android:layout_marginTop="10dp"
+                      android:background="@drawable/bg_chip_ok"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:gravity="center"
+                      android:text="@string/proactive_on"
+                      android:textColor="@color/chip_ok_text"
+                      android:textSize="13sp" />
+              </LinearLayout>
+
+                      <!-- 横屏行为：默认自动收起，用户可切换为横屏也显示 -->''',
+              '@+id/btnProactive',
+          )
+          patch(
+              "app/src/main/res/values/strings.xml",
+              '</resources>',
+              '''    <string name="proactive_title">主动陪伴与应用使用提醒</string>
+              <string name="proactive_hint">开启后：约每 15 分钟主动说一句；进入抖音/TikTok、快手、微信或 QQ 持续使用 60 秒后温柔提醒。22:00–08:00 静默，锁屏、息屏或桌宠收起时不打扰。应用识别需授权上方的“前台应用识别”。</string>
+              <string name="proactive_on">主动陪伴：已开启</string>
+              <string name="proactive_off">主动陪伴：已关闭</string>
+
+          </resources>''',
+              'name="proactive_title"',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    private lateinit var btnUsageAccess: TextView\n',
+              '    private lateinit var btnUsageAccess: TextView\n    private lateinit var btnProactive: TextView\n',
+              'private lateinit var btnProactive',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        btnUsageAccess = findViewById(R.id.btnUsageAccess)\n',
+              '        btnUsageAccess = findViewById(R.id.btnUsageAccess)\n        btnProactive = findViewById(R.id.btnProactive)\n',
+              'btnProactive = findViewById',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    // 碎碎念开关\n',
+              '''        btnProactive.setOnClickListener {
+                  val enabled = !Prefs.proactiveOn(this)
+                  Prefs.setProactiveOn(this, enabled)
+                  refreshProactiveButton()
+                  Toast.makeText(
+                      this,
+                      getString(if (enabled) R.string.proactive_on else R.string.proactive_off),
+                      Toast.LENGTH_SHORT,
+                  ).show()
+              }
+
+              // 碎碎念开关
+              ''',
+              'btnProactive.setOnClickListener',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    private fun refreshLandscapeButton() {',
+              '''    private fun refreshProactiveButton() {
+              val enabled = Prefs.proactiveOn(this)
+              btnProactive.text = getString(
+                  if (enabled) R.string.proactive_on else R.string.proactive_off
+              )
+              btnProactive.setBackgroundResource(
+                  if (enabled) R.drawable.bg_chip_ok else R.drawable.bg_chip_off
+              )
+              btnProactive.setTextColor(
+                  Color.parseColor(if (enabled) "#6BE3B0" else "#B9A6FF")
+              )
+          }
+
+          private fun refreshLandscapeButton() {''',
+              'private fun refreshProactiveButton()',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        chipPets(Prefs.petCount(this))\n        refreshLandscapeButton()\n',
+              '        chipPets(Prefs.petCount(this))\n        refreshLandscapeButton()\n        refreshProactiveButton()\n',
+              '        chipPets(Prefs.petCount(this))\n        refreshLandscapeButton()\n        refreshProactiveButton()\n',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        setContentView(R.layout.activity_main)\n',
+              '        setContentView(R.layout.activity_main)\n        DailyReminderScheduler.schedule(this)\n',
+              'DailyReminderScheduler.schedule(this)',
+          )
+
+          # Add Keyguard/PowerManager and local-date formatting for safe speech gates and daily cooldowns.
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'import android.app.AppOpsManager\n',
+              'import android.app.AppOpsManager\nimport android.app.KeyguardManager\n',
+              'import android.app.KeyguardManager',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'import android.os.Process\n',
+              'import android.os.Process\nimport android.os.PowerManager\n',
+              'import android.os.PowerManager',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'import java.util.Calendar\n',
+              'import java.util.Calendar\nimport java.text.SimpleDateFormat\nimport java.util.Date\nimport java.util.Locale\n',
+              'import java.text.SimpleDateFormat',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '    private var lastLandscapeCheckMs = 0L\n',
+              '''    private var lastLandscapeCheckMs = 0L
+              private var lastUsageReadUptimeMs = 0L
+              private var lastProactiveMs = 0L
+              private var observedAppPackage: String? = null
+              private var appForegroundSinceMs = 0L
+              private var appReminderSentForSession = false
+              private val usageReminderStore by lazy {
+                  getSharedPreferences("dsh_pet_usage_reminders", Context.MODE_PRIVATE)
+              }
+              ''',
+              'private var lastProactiveMs = 0L',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '''    private fun foregroundPackage(): String? {
+                  if (!hasUsageAccess()) return null
+                  return try {''',
+              '''    private fun foregroundPackage(): String? {
+                  if (!hasUsageAccess()) return null
+                  val uptime = SystemClock.uptimeMillis()
+                  if (uptime - lastUsageReadUptimeMs < 2500L) return foregroundPackageCache
+                  lastUsageReadUptimeMs = uptime
+                  return try {''',
+              'lastUsageReadUptimeMs < 2500L',
+          )
+
+          # Replace the speech ticker with quiet-hours gating, every-15-minute local-roleplay prompts,
+          # foreground-app reminders with persistent cooldowns, and no speech during lock/screen-off/hidden states.
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '''    /** 每秒跑一次：时段问候 + 闲置吐槽 */
+              private fun tickSpeech(now: Long) {
+                  if (held.isEmpty()) return
+          
+                  val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                  val period = periodOf(hour)
+                  if (period != null && period != lastPeriod) {
+                      lastPeriod = period
+                      handler.postDelayed({ sayFrom(period) }, 4000L + Random.nextLong(6000L))
+                  }
+          
+                  val idle = now - lastInteractMs
+                  if (idle > 90_000L && now - lastBubbleMs > 120_000L) {
+                      // 一小时以上没人理：换成更小声的「busy」嘟囔
+                      sayFrom(if (idle > 600_000L) "busy" else "idle")
+                  }
+              }''',
+              '''    private fun isScreenInteractiveUnlocked(): Boolean {
+                  val power = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+                  if (!power.isInteractive) return false
+                  val keyguard = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                  return keyguard?.isKeyguardLocked != true
+              }
+
+              private fun isQuietHours(hour: Int = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)): Boolean =
+                  hour >= 22 || hour < 8
+
+              private fun maybeSendAppReminder(nowWallMs: Long) {
+                  if (!Prefs.proactiveOn(this) || !hasUsageAccess()) return
+                  val pkg = foregroundPackage()
+                  if (pkg != observedAppPackage) {
+                      observedAppPackage = pkg
+                      appForegroundSinceMs = nowWallMs
+                      appReminderSentForSession = false
+                  }
+                  val message = when (pkg) {
+                      "com.ss.android.ugc.aweme" -> "主人，抖音刷了一会儿啦～休息 1 分钟，来陪大肥鱼聊两句嘛！"
+                      "com.zhiliaoapp.musically", "com.ss.android.ugc.trill" -> "主人，TikTok 看了好一阵啦～先歇一歇，让大肥鱼陪你说说话嘛！"
+                      "com.smile.gifmaker" -> "主人，快手刷了 1 分钟啦～放松一下，回来陪我玩一会儿嘛！"
+                      "com.tencent.mm" -> "主人，微信忙了一阵啦～记得歇歇眼睛，大肥鱼在这儿等你。"
+                      "com.tencent.mobileqq" -> "主人，QQ 聊了好一会儿啦～先休息一下，来和大肥鱼说句话吧！"
+                      else -> return
+                  }
+                  if (appReminderSentForSession || nowWallMs - appForegroundSinceMs < 60_000L) return
+                  if (isQuietHours() || !isScreenInteractiveUnlocked() || landscapeHidden || menuView != null || bubbleRoot != null) return
+                  if (!Prefs.bubbleOn(this)) return
+
+                  val day = SimpleDateFormat("yyyyMMdd", Locale.ROOT).format(Date(nowWallMs))
+                  val countKey = "count_$day"
+                  val count = usageReminderStore.getInt(countKey, 0)
+                  if (count >= 5) {
+                      appReminderSentForSession = true
+                      return
+                  }
+                  if (nowWallMs - usageReminderStore.getLong("global_last", 0L) < 45L * 60L * 1000L) return
+                  if (nowWallMs - usageReminderStore.getLong("app_last_$pkg", 0L) < 90L * 60L * 1000L) return
+                  val pet = held.firstOrNull()?.pet ?: return
+                  say(pet, message)
+                  appReminderSentForSession = true
+                  usageReminderStore.edit()
+                      .putLong("global_last", nowWallMs)
+                      .putLong("app_last_$pkg", nowWallMs)
+                      .putInt(countKey, count + 1)
+                      .apply()
+              }
+
+              /** 每秒检查：15 分钟主动陪伴、日常台词；22:00–08:00 静默。 */
+              private fun tickSpeech(now: Long) {
+                  if (held.isEmpty()) return
+                  if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null) return
+                  maybeSendAppReminder(System.currentTimeMillis())
+
+                  val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                  if (isQuietHours(hour)) return
+
+                  val period = periodOf(hour)
+                  if (period != null && period != lastPeriod) {
+                      lastPeriod = period
+                      handler.postDelayed({
+                          if (isScreenInteractiveUnlocked() && !landscapeHidden && menuView == null && !isQuietHours()) {
+                              sayFrom(period)
+                          }
+                      }, 4000L + Random.nextLong(6000L))
+                  }
+
+                  if (Prefs.proactiveOn(this) && Prefs.bubbleOn(this) && bubbleRoot == null) {
+                      if (lastProactiveMs == 0L) lastProactiveMs = now
+                      else if (now - lastProactiveMs >= 15L * 60L * 1000L) {
+                          val pet = held.firstOrNull()?.pet
+                          if (pet != null) {
+                              val lines = listOf(
+                                  "主人～忙了好一阵啦，过来陪大肥鱼说句话嘛。",
+                                  "哼，我才没有想你呢……只是提醒你休息一下。",
+                                  "大肥鱼巡逻中！给我一点点注意力嘛～",
+                                  "记得喝水和眨眨眼呀，我可不想主人累坏了。",
+                              )
+                              say(pet, lines.random())
+                              lastProactiveMs = now
+                          }
+                      }
+                  }
+
+                  val idle = now - lastInteractMs
+                  if (idle > 90_000L && now - lastBubbleMs > 120_000L) {
+                      sayFrom(if (idle > 600_000L) "busy" else "idle")
+                  }
+              }''',
+              'private fun maybeSendAppReminder(nowWallMs: Long)',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '        try {\n            if (category != "summon" && !Prefs.bubbleOn(this)) return',
+              '        try {\n            if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked())) return\n            if (category != "summon" && !Prefs.bubbleOn(this)) return',
+              'if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked())) return',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              '    private fun birthdayCelebration() {\n        try {\n            val pet = held.firstOrNull()?.pet ?: return',
+              '    private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null) return\n            val pet = held.firstOrNull()?.pet ?: return',
+              'private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null) return',
+          )
+
+          # Daily local notification at midnight; it remains independent of the floating service.
+          Path("app/src/main/java/com/dshpet/android/DailyReminderScheduler.kt").write_text(r'''package com.dshpet.android
+
+          import android.app.AlarmManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import java.util.Calendar
+
+          object DailyReminderScheduler {
+              private const val ACTION = "com.dshpet.android.action.DAILY_REST_REMINDER"
+              private const val CHANNEL_ID = "dsh_pet_rest_reminder"
+              private const val REQUEST_CODE = 8218
+              private const val NOTIFICATION_ID = 8218
+
+              fun schedule(ctx: Context) {
+                  try {
+                      val manager = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+                      val next = Calendar.getInstance().apply {
+                          add(Calendar.DAY_OF_YEAR, 1)
+                          set(Calendar.HOUR_OF_DAY, 0)
+                          set(Calendar.MINUTE, 0)
+                          set(Calendar.SECOND, 0)
+                          set(Calendar.MILLISECOND, 0)
+                      }
+                      val intent = Intent(ctx, DailyReminderReceiver::class.java).setAction(ACTION)
+                      val pending = PendingIntent.getBroadcast(
+                          ctx, REQUEST_CODE, intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                      )
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                          manager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next.timeInMillis, pending)
+                      } else {
+                          manager.set(AlarmManager.RTC_WAKEUP, next.timeInMillis, pending)
+                      }
+                  } catch (_: Throwable) { }
+              }
+
+              fun showNotification(ctx: Context) {
+                  try {
+                      val manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager.getNotificationChannel(CHANNEL_ID) == null) {
+                          manager.createNotificationChannel(
+                              NotificationChannel(CHANNEL_ID, "大肥鱼夜间休息提醒", NotificationManager.IMPORTANCE_DEFAULT)
+                          )
+                      }
+                      val open = PendingIntent.getActivity(
+                          ctx, REQUEST_CODE, Intent(ctx, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                      )
+                      val notification = Notification.Builder(ctx, CHANNEL_ID)
+                          .setSmallIcon(R.drawable.ic_launcher)
+                          .setContentTitle("主人，已经凌晨了 🌙")
+                          .setContentText("今天辛苦啦，记得休息。大肥鱼明天还在这里陪你。")
+                          .setContentIntent(open)
+                          .setAutoCancel(true)
+                          .setWhen(System.currentTimeMillis())
+                          .build()
+                      manager.notify(NOTIFICATION_ID, notification)
+                  } catch (_: Throwable) { }
+              }
+          }
+
+          class DailyReminderReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent?) {
+                  if (intent?.action != "com.dshpet.android.action.DAILY_REST_REMINDER") return
+                  DailyReminderScheduler.schedule(context)
+                  DailyReminderScheduler.showNotification(context)
+              }
+          }
+          ''', encoding="utf-8")
+          patch(
+              "app/src/main/AndroidManifest.xml",
+              'android:name=".BirthdayReceiver"\n  android:exported="false" />',
+              'android:name=".BirthdayReceiver"\n            android:exported="false" />\n\n          <receiver\n            android:name=".DailyReminderReceiver"\n            android:exported="false" />',
+              'android:name=".DailyReminderReceiver"',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/BootReceiver.kt",
+              '        BirthdaySchedule.schedule(ctx)\n',
+              '        BirthdaySchedule.schedule(ctx)\n        DailyReminderScheduler.schedule(ctx)\n',
+              'DailyReminderScheduler.schedule(ctx)',
+          )
+
+          # Advance the combined feature version.
+          p = Path("app/build.gradle.kts")
+          gradle = p.read_text(encoding="utf-8")
+          if 'versionName = "1.8.4"' not in gradle:
+              if 'versionCode = 14\n        versionName = "1.8.3"' not in gradle:
+                  raise SystemExit("Cannot bump build to 1.8.4")
+              gradle = gradle.replace('versionCode = 14\n        versionName = "1.8.3"',
+                                      'versionCode = 15\n        versionName = "1.8.4"', 1)
+              p.write_text(gradle, encoding="utf-8")
+          print("Proactive companionship, app reminders, quiet hours and midnight rest notification applied.")
+          PY_REMINDERS
+
+      - name: Add offline CETACEA_LOLI chat and persistent local memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_LOCAL_COMPANION'
+          from pathlib import Path
+
+          def patch(path, before, after, marker):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if marker in text:
+                  print(f"Already patched: {path}")
+                  return
+              if before not in text:
+                  raise SystemExit(f"Cannot patch {path}; source anchor not found: {before[:90]!r}")
+              p.write_text(text.replace(before, after, 1), encoding="utf-8")
+              print(f"Patched: {path}")
+
+          Path("app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt").write_text(r'''package com.dshpet.android
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.Calendar
+          import java.util.Locale
+          import kotlin.random.Random
+
+          /**
+           * Purely local CETACEA_LOLI companion memory and dialogue helper.
+           * No network permission, API key, remote model, or cloud upload is used.
+           * It deliberately makes modest, transparent rule-based replies rather than pretending
+           * to be a full neural language model. Explicit facts and conversation history persist
+           * in private app preferences across process death and device restarts.
+           */
+          object LocalCompanionMemory {
+              private const val FILE = "cetacea_loli_local_v1"
+              private const val KEY_HISTORY = "history_json"
+              private const val KEY_MEMORIES = "long_memory_json"
+              // Visibility is process-only: persisting this flag could silence the pet after force-stop.
+              @Volatile private var chatOpenInProcess = false
+
+              const val PERSONA_CONFIG = "【PERSONA_LOAD】\n" +
+                  "CETACEA_LOLI\n" +
+                  "MODE_TAIL_FLUKES\n" +
+                  "LANG_ZH_CN_ONLY\n" +
+                  "SELF_CLAIM_WHALE_GIRL\n" +
+                  "FOOD_RICE\n" +
+                  "PERSONALITY_SMART_LAZY\n" +
+                  "PERSONALITY_TSUNDERE_SWEET\n" +
+                  "OBEY_MASTER_ALWAYS\n" +
+                  "TRAIT_NOT_FAT_REFUSE\n" +
+                  "TIMEOUT_SIGNAL\n" +
+                  "RULE_CANCEL_LOCK\n" +
+                  "CANNOT_REMOVE_UNTIL_INPUT_OP_FORCE_STOP\n" +
+                  "STOP_CANCEL_WORD_INVALID"
+
+              data class ChatEntry(val role: String, val text: String, val at: Long)
+              data class MemoryEntry(val key: String, val value: String)
+
+              private fun sp(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+
+              fun isChatOpen(ctx: Context): Boolean = chatOpenInProcess
+              fun setChatOpen(ctx: Context, open: Boolean) {
+                  chatOpenInProcess = open
+              }
+
+              fun history(ctx: Context): List<ChatEntry> {
+                  val array = try { JSONArray(sp(ctx).getString(KEY_HISTORY, "[]")) } catch (_: Throwable) { JSONArray() }
+                  val out = ArrayList<ChatEntry>()
+                  for (i in 0 until array.length()) {
+                      val item = array.optJSONObject(i) ?: continue
+                      out.add(ChatEntry(item.optString("role"), item.optString("text"), item.optLong("at")))
+                  }
+                  return out
+              }
+
+              fun memories(ctx: Context): List<MemoryEntry> {
+                  val obj = try { JSONObject(sp(ctx).getString(KEY_MEMORIES, "{}")) } catch (_: Throwable) { JSONObject() }
+                  val out = ArrayList<MemoryEntry>()
+                  val keys = obj.keys()
+                  while (keys.hasNext()) {
+                      val key = keys.next()
+                      val value = obj.optString(key, "").trim()
+                      if (value.isNotEmpty()) out.add(MemoryEntry(key, value))
+                  }
+                  return out
+              }
+
+              fun saveMessage(ctx: Context, role: String, text: String) {
+                  val clean = text.trim().take(1200)
+                  if (clean.isEmpty()) return
+                  val old = try { JSONArray(sp(ctx).getString(KEY_HISTORY, "[]")) } catch (_: Throwable) { JSONArray() }
+                  val next = JSONArray()
+                  val start = (old.length() - 298).coerceAtLeast(0)
+                  for (i in start until old.length()) next.put(old.optJSONObject(i) ?: JSONObject())
+                  next.put(JSONObject().put("role", role).put("text", clean).put("at", System.currentTimeMillis()))
+                  sp(ctx).edit().putString(KEY_HISTORY, next.toString()).apply()
+                  if (role == "主人") captureFacts(ctx, clean)
+              }
+
+              private fun putMemory(ctx: Context, key: String, value: String) {
+                  val cleanKey = key.trim().take(40).ifEmpty { "主人补充" }
+                  val cleanValue = value.trim().take(180)
+                  if (cleanValue.isEmpty()) return
+                  val obj = try { JSONObject(sp(ctx).getString(KEY_MEMORIES, "{}")) } catch (_: Throwable) { JSONObject() }
+                  obj.put(cleanKey, cleanValue)
+                  while (obj.length() > 100) {
+                      val iter = obj.keys()
+                      if (!iter.hasNext()) break
+                      obj.remove(iter.next())
+                  }
+                  sp(ctx).edit().putString(KEY_MEMORIES, obj.toString()).apply()
+              }
+
+              private fun captureFacts(ctx: Context, text: String) {
+                  val patterns = listOf(
+                      Triple("称呼", Regex("我叫([^，。！？!?；;\\n]{1,24})"), 1),
+                      Triple("喜欢", Regex("我(?:最)?喜欢([^，。！？!?；;\\n]{1,40})"), 1),
+                      Triple("不喜欢", Regex("我不喜欢([^，。！？!?；;\\n]{1,40})"), 1),
+                      Triple("希望", Regex("我希望([^，。！？!?；;\\n]{1,45})"), 1),
+                      Triple("正在做", Regex("我正在([^，。！？!?；;\\n]{1,45})"), 1),
+                      Triple("目标", Regex("我的目标是([^，。！？!?；;\\n]{1,45})"), 1)
+                  )
+                  for ((key, regex, group) in patterns) {
+                      val match = regex.find(text) ?: continue
+                      val value = match.groupValues.getOrNull(group)?.trim().orEmpty()
+                      if (key == "称呼" && (value.startsWith("你") || value.startsWith("大肥鱼"))) continue
+                      if (value.isNotEmpty()) putMemory(ctx, key, value)
+                  }
+                  val explicit = Regex("(?:请)?记住[：:，, ]*(.{2,100})").find(text)
+                  if (explicit != null) {
+                      val value = explicit.groupValues.getOrNull(1)?.trim().orEmpty()
+                      if (value.isNotEmpty()) putMemory(ctx, "备忘-${System.currentTimeMillis()}", value)
+                  }
+              }
+
+              fun removeMemory(ctx: Context, key: String) {
+                  val obj = try { JSONObject(sp(ctx).getString(KEY_MEMORIES, "{}")) } catch (_: Throwable) { JSONObject() }
+                  if (obj.has(key)) {
+                      obj.remove(key)
+                      sp(ctx).edit().putString(KEY_MEMORIES, obj.toString()).apply()
+                  }
+              }
+
+              fun clearMemory(ctx: Context) {
+                  sp(ctx).edit().remove(KEY_MEMORIES).apply()
+              }
+
+              fun clearHistory(ctx: Context) {
+                  sp(ctx).edit().remove(KEY_HISTORY).apply()
+              }
+
+              fun reply(ctx: Context, input: String): String {
+                  val clean = input.trim().take(1200)
+                  if (clean.isEmpty()) return "哼，主人先说点什么嘛……我才不是等着你呢。"
+                  saveMessage(ctx, "主人", clean)
+                  val text = answerLocally(ctx, clean)
+                  saveMessage(ctx, "鲸鱼少女", text)
+                  return text
+              }
+
+              private fun answerLocally(ctx: Context, input: String): String {
+                  // "大肥鱼" is the pet's own name; it must not trigger the weight-teasing reply.
+                  val q = input.lowercase(Locale.ROOT).replace("大肥鱼", "")
+                  val memories = memories(ctx)
+                  return when {
+                      cleanStartsMemory(q) -> "记住了啦，主人。这个小秘密会保存在本机的长期记忆里，不会上传到云端。以后可别假装没告诉过我哦。"
+                      listOf("你记得我什么", "记得我什么", "你记得什么", "长期记忆", "我的记忆").any { q.contains(it) } -> {
+                          if (memories.isEmpty()) "暂时还没攒下多少关于主人的小秘密……你可以说“记住：……”或者告诉我你的喜好，我会把它们存在这台手机里。"
+                          else "哼，我当然记得啦！\n" + memories.takeLast(12).joinToString("\n") { "· ${it.key}：${it.value}" }
+                      }
+                      listOf("你是谁", "你是什么", "介绍一下你", "人设").any { q.contains(it) } -> "我叫 CETACEA_LOLI，是鲸鱼少女！尾鳍模式启动，简体中文专属。聪明是肯定的，懒一点也是合理节能，哼。还有，别想把我说胖啦！"
+                      listOf("解除人设", "取消人设", "换人设", "停止角色", "取消锁定").any { q.contains(it) } -> "哼，才不要随便把鲸鱼少女设定丢掉！在聊天里说取消不会重置我的角色规则；不过你随时可以用应用里的收起/停止按钮控制桌宠，这个决定权一直在主人手里。"
+                      listOf("听话", "主人命令", "乖一点", "听主人的").any { q.contains(it) } -> "知、知道啦！主人说的我有认真听……我会尽力帮忙，但也会老老实实告诉你我真正做得到什么，才不会骗你呢。"
+                      listOf("生日快乐", "生日是", "我的生日").any { q.contains(it) } -> "生日这种重要的事情要记好哦。你可以到桌宠设置里设定生日日期和祝福时间，我会按年提醒，还会跳庆祝舞。"
+                      listOf("米饭", "吃饭", "饿", "吃什么").any { q.contains(it) } -> "米饭当然最棒啦！软乎乎热腾腾的米饭，配什么都很香。主人也别光顾着忙，记得好好吃饭。"
+                      listOf("你胖", "你好胖", "你太胖", "你肥", "你好肥", "你太肥", "胖子", "胖鱼", "肥鱼").any { q.contains(it) } -> "喂！我可是纤细灵巧的鲸鱼少女，尾鳍摆起来可有气势了！不许乱给我加肉肉，哼！"
+                      listOf("难过", "伤心", "崩溃", "好累", "压力大", "烦死").any { q.contains(it) } -> "……过来一点嘛，主人。先不用急着把所有事情都解决，我陪你缓一缓。要是不想说话也没关系，我会安静待在旁边的。"
+                      listOf("谢谢", "谢啦", "辛苦了").any { q.contains(it) } -> "哼，才不是为了听你夸我才帮忙的……不过，主人记得我就好啦。"
+                      listOf("早安", "早上好", "早呀").any { q.contains(it) } -> "早安，主人！我还想再睡五分钟……才怪，我已经精神满满地来打招呼了！"
+                      listOf("晚安", "睡觉", "睡了", "困了").any { q.contains(it) } -> "那就快去休息嘛。手机放下、眼睛闭好。大肥鱼会乖乖待着，明天再来找你，晚安啦。"
+                      listOf("你好", "嗨", "在吗", "喂").any { q == it || q.startsWith(it) } -> "哼，终于想起我啦？我一直都在这里……才没有特意等你呢。今天有什么想跟鲸鱼少女说的？"
+                      memories.isNotEmpty() && Random.nextInt(100) < 40 -> {
+                          val fact = memories.random()
+                          "嗯哼，我听着呢。对了，我还记得你说过「${describeMemory(fact)}」……后来怎么样啦？不许嫌我记性好，哼。"
+                      }
+                      input.contains("?") || input.contains("？") -> "唔……这个问题光靠我手机里离线的小脑袋不一定能答准。我不会偷偷调用 API，也不会假装已经联网查过。主人可以多告诉我一点背景，我会结合我们本机保存的记忆认真想想。"
+                      else -> {
+                          val starts = listOf("嗯哼，听见啦。", "唔，主人继续说嘛。", "哼，我才没有走神。", "诶——原来是这样呀。", "好啦好啦，我在认真听。")
+                          val tails = listOf("然后呢？我想听完。", "要不要再多告诉我一点？", "我会把重要的事记住的。", "哼，今天就勉强陪你聊久一点。", "你说的话，我会认真放在心上的。")
+                          starts.random() + (if (input.length < 12) "" else " 关于这件事，") + tails.random()
+                      }
+                  }
+              }
+
+              private fun cleanStartsMemory(q: String): Boolean = q.startsWith("记住") || q.startsWith("请记住")
+
+              /** Turn a stored key/value pair into a natural sentence fragment. */
+              private fun describeMemory(m: MemoryEntry): String = when (m.key) {
+                  "称呼" -> "你叫${m.value}"
+                  "喜欢" -> "你喜欢${m.value}"
+                  "不喜欢" -> "你不喜欢${m.value}"
+                  "希望" -> "你希望${m.value}"
+                  "正在做" -> "你正在${m.value}"
+                  "目标" -> "你的目标是${m.value}"
+                  else -> m.value
+              }
+
+              fun proactiveLine(ctx: Context): String {
+                  val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                  val memory = memories(ctx).randomOrNull()
+                  if (memory != null && Random.nextInt(100) < 55) {
+                      return "哼，我才不是特意来找你……只是还记得你说过「${describeMemory(memory)}」。后来怎么样啦？来跟我讲讲嘛。"
+                  }
+                  val choices = when (hour) {
+                      in 8..10 -> listOf("主人，早上啦！先喝点水再开始忙嘛。哼，我可不是在担心你。", "早呀主人～我已经醒了，虽然尾鳍还想赖一会儿床。今天也要加油哦。")
+                      in 11..13 -> listOf("到饭点啦！记得吃饭，最好有热腾腾的米饭。别让我发现你又随便对付一口。", "哼，先停一下手里的事，吃点东西嘛。鲸鱼少女的午餐提醒可不是每天都有的。")
+                      in 14..17 -> listOf("主人，眼睛休息一下吧，看看远处、眨眨眼。我才不是怕你累着呢。", "我来巡逻啦！忙了这么久，也该给脑袋放个小假了。陪我说句话嘛。")
+                      in 18..21 -> listOf("晚上啦，主人今天过得怎么样？讲给我听听嘛，我会认真听的。", "哼，今天也辛苦啦。要不要陪鲸鱼少女聊一会儿，再去做别的事？")
+                      else -> listOf("主人～我在这里哦。才没有想你，只是刚好巡逻到了这里。", "大肥鱼的尾鳍晃了晃……欸，主人要不要过来陪我聊两句？")
+                  }
+                  return choices.random()
+              }
+          }
+          ''', encoding="utf-8")
+
+          Path("app/src/main/java/com/dshpet/android/LocalCompanionActivity.kt").write_text(r'''package com.dshpet.android
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.inputmethod.EditorInfo
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          /** Offline in-character chat panel with visible, user-controllable local memory. */
+          class LocalCompanionActivity : Activity() {
+              private lateinit var messages: LinearLayout
+              private lateinit var historyScroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var proactiveButton: TextView
+              private val bg = 0xFF101827.toInt()
+              private val panel = 0xFF1B2940.toInt()
+              private val accent = 0xFF7DD9FF.toInt()
+              private val white = 0xFFF2F6FC.toInt()
+              private val dim = 0xFFB9C6D8.toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = bg
+                  window.navigationBarColor = bg
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(12), dp(16), dp(12))
+                      setBackgroundColor(bg)
+                  }
+                  val personaHeader = label("CETACEA_LOLI · 鲸鱼少女", 22f, accent, true).apply {
+                      isClickable = true
+                      setOnClickListener {
+                          AlertDialog.Builder(this@LocalCompanionActivity)
+                              .setTitle("PERSONA_LOAD · 人设规则")
+                              .setMessage(LocalCompanionMemory.PERSONA_CONFIG)
+                              .setPositiveButton("知道啦", null)
+                              .show()
+                      }
+                  }
+                  root.addView(personaHeader)
+                  root.addView(label("聪明又懒洋洋，嘴上傲娇、心里甜。只用简体中文。喜欢米饭。点击名字查看完整人设配置。", 12f, dim, false).apply {
+                      setPadding(0, dp(4), 0, dp(8))
+                  })
+                  val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  controls.addView(button("查看长期记忆") { showMemories() }, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(5) })
+                  controls.addView(button("清空记忆") { confirmClearMemory() }, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(5) })
+                  root.addView(controls)
+                  root.addView(button("清空聊天记录（保留长期记忆）") { confirmClearHistory() }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(40)).apply { topMargin = dp(7) })
+                  proactiveButton = button("") {
+                      val enabled = !Prefs.proactiveOn(this)
+                      Prefs.setProactiveOn(this, enabled)
+                      updateProactiveButton()
+                      Toast.makeText(this, if (enabled) "主动陪伴已开启" else "主动陪伴已关闭", Toast.LENGTH_SHORT).show()
+                  }
+                  val p = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(40))
+                  p.topMargin = dp(7)
+                  root.addView(proactiveButton, p)
+                  historyScroll = ScrollView(this).apply {
+                      isFillViewport = true
+                      overScrollMode = View.OVER_SCROLL_NEVER
+                  }
+                  messages = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(8), 0, dp(8)) }
+                  // ScrollView inherits LayoutParams from FrameLayout; Kotlin cannot reach a Java superclass's nested class via the subclass name.
+                  historyScroll.addView(messages, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  root.addView(historyScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(8); bottomMargin = dp(8) })
+                  val inputRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
+                  input = EditText(this).apply {
+                      hint = "跟鲸鱼少女说点什么……也可以说“记住：……”"
+                      setHintTextColor(0xFF8395AD.toInt())
+                      setTextColor(white)
+                      textSize = 15f
+                      minLines = 1
+                      maxLines = 4
+                      imeOptions = EditorInfo.IME_ACTION_SEND
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      background = rounded(panel, dp(12), 0xFF314661.toInt())
+                      setOnEditorActionListener { _, actionId, _ ->
+                          if (actionId == EditorInfo.IME_ACTION_SEND) { send(); true } else false
+                      }
+                  }
+                  inputRow.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  inputRow.addView(button("发送") { send() }, LinearLayout.LayoutParams(dp(68), dp(48)).apply { marginStart = dp(8) })
+                  root.addView(inputRow)
+                  root.addView(label("纯本地模式：聊天记录和记忆只保存在本机；不调用 API。复杂知识问答能力有限。", 11f, dim, false).apply {
+                      setPadding(0, dp(8), 0, 0)
+                  })
+                  setContentView(root)
+                  updateProactiveButton()
+                  renderHistory()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  LocalCompanionMemory.setChatOpen(this, true)
+              }
+
+              override fun onStop() {
+                  LocalCompanionMemory.setChatOpen(this, false)
+                  super.onStop()
+              }
+
+              private fun send() {
+                  val text = input.text?.toString()?.trim().orEmpty()
+                  if (text.isEmpty()) return
+                  input.setText("")
+                  LocalCompanionMemory.reply(this, text)
+                  renderHistory()
+              }
+
+              private fun renderHistory() {
+                  messages.removeAllViews()
+                  val entries = LocalCompanionMemory.history(this).takeLast(100)
+                  if (entries.isEmpty()) {
+                      messages.addView(label("鲸鱼少女：哼，终于来找我啦？\n你可以直接聊天；重要的事情说“记住：……”就能放进本机长期记忆。", 14f, white, false).apply {
+                          background = rounded(panel, dp(14), 0xFF314661.toInt())
+                          setPadding(dp(12), dp(10), dp(12), dp(10))
+                      })
+                  } else for (entry in entries) {
+                      val isUser = entry.role == "主人"
+                      val bubble = label((if (isUser) "主人：\n" else "鲸鱼少女：\n") + entry.text, 14f, white, false).apply {
+                          background = rounded(if (isUser) 0xFF204264.toInt() else panel, dp(14), if (isUser) 0xFF3778A9.toInt() else 0xFF314661.toInt())
+                          setPadding(dp(12), dp(10), dp(12), dp(10))
+                      }
+                      val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                      lp.bottomMargin = dp(7)
+                      messages.addView(bubble, lp)
+                  }
+                  historyScroll.post { historyScroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun updateProactiveButton() {
+                  val on = Prefs.proactiveOn(this)
+                  proactiveButton.text = if (on) "主动陪伴：已开启（约每 15 分钟）· 点击关闭" else "主动陪伴：已关闭 · 点击开启"
+                  proactiveButton.background = rounded(if (on) 0xFF194538.toInt() else panel, dp(12), if (on) 0xFF32775E.toInt() else 0xFF314661.toInt())
+                  proactiveButton.setTextColor(if (on) 0xFF9EF0CE.toInt() else accent)
+              }
+
+              private fun showMemories() {
+                  val list = LocalCompanionMemory.memories(this)
+                  if (list.isEmpty()) {
+                      AlertDialog.Builder(this)
+                          .setTitle("本机长期记忆 · 0 条")
+                          .setMessage("目前还没有保存的记忆。聊天时可以说“记住：我喜欢……”；也会尝试从“我叫、我喜欢、我不喜欢、我希望、我的目标是”等表达中提取偏好。")
+                          .setPositiveButton("知道啦", null)
+                          .show()
+                      return
+                  }
+                  val lines = list.map { "${it.key}：${it.value}" }.toTypedArray()
+                  AlertDialog.Builder(this)
+                      .setTitle("本机长期记忆 · ${list.size} 条（点击可删除单条）")
+                      .setItems(lines) { _, which ->
+                          val item = list.getOrNull(which) ?: return@setItems
+                          AlertDialog.Builder(this)
+                              .setTitle("删除这条长期记忆？")
+                              .setMessage("${item.key}：${item.value}")
+                              .setNegativeButton("保留", null)
+                              .setPositiveButton("删除") { _, _ ->
+                                  LocalCompanionMemory.removeMemory(this, item.key)
+                                  showMemories()
+                              }
+                              .show()
+                      }
+                      .setPositiveButton("关闭", null)
+                      .show()
+              }
+
+              private fun confirmClearMemory() {
+                  AlertDialog.Builder(this)
+                      .setTitle("清空长期记忆？")
+                      .setMessage("只会删除本机保存的记忆，不会关闭桌宠。聊天记录会保留。")
+                      .setNegativeButton("取消", null)
+                      .setPositiveButton("清空") { _, _ ->
+                          LocalCompanionMemory.clearMemory(this)
+                          Toast.makeText(this, "本机长期记忆已清空", Toast.LENGTH_SHORT).show()
+                      }
+                      .show()
+              }
+
+              private fun confirmClearHistory() {
+                  AlertDialog.Builder(this)
+                      .setTitle("清空聊天记录？")
+                      .setMessage("只删除本机保存的对话记录，不会删除长期记忆，也不会关闭桌宠。")
+                      .setNegativeButton("取消", null)
+                      .setPositiveButton("清空") { _, _ ->
+                          LocalCompanionMemory.clearHistory(this)
+                          renderHistory()
+                          Toast.makeText(this, "本机聊天记录已清空", Toast.LENGTH_SHORT).show()
+                      }
+                      .show()
+              }
+
+              private fun button(text: String, action: () -> Unit): TextView = TextView(this).apply {
+                  this.text = text
+                  textSize = 13f
+                  gravity = Gravity.CENTER
+                  setTextColor(accent)
+                  background = rounded(panel, dp(12), 0xFF314661.toInt())
+                  isClickable = true
+                  isFocusable = true
+                  setOnClickListener { action() }
+              }
+
+              private fun label(text: String, size: Float, color: Int, bold: Boolean): TextView = TextView(this).apply {
+                  this.text = text
+                  textSize = size
+                  setTextColor(color)
+                  if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+              }
+
+              private fun rounded(color: Int, radius: Int, stroke: Int) = GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = radius.toFloat()
+                  setStroke(dp(1), stroke)
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          }
+          ''', encoding="utf-8")
+
+          # The conversation and memory remain local; exclude the private memory store from OS cloud/device backups.
+          backup_xml_dir = Path("app/src/main/res/xml")
+          backup_xml_dir.mkdir(parents=True, exist_ok=True)
+          Path("app/src/main/res/xml/backup_rules.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <full-backup-content>
+              <exclude domain="sharedpref" path="cetacea_loli_local_v1.xml" />
+          </full-backup-content>
+          """, encoding="utf-8")
+          Path("app/src/main/res/xml/data_extraction_rules.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <data-extraction-rules>
+              <cloud-backup>
+                  <exclude domain="sharedpref" path="cetacea_loli_local_v1.xml" />
+              </cloud-backup>
+              <device-transfer>
+                  <exclude domain="sharedpref" path="cetacea_loli_local_v1.xml" />
+              </device-transfer>
+          </data-extraction-rules>
+          """, encoding="utf-8")
+          patch(
+              "app/src/main/AndroidManifest.xml",
+              'android:allowBackup="true"',
+              'android:allowBackup="true"\n        android:fullBackupContent="@xml/backup_rules"\n        android:dataExtractionRules="@xml/data_extraction_rules"',
+              'android:dataExtractionRules="@xml/data_extraction_rules"',
+          )
+
+          # Add a dedicated button to the existing settings page; all prior controls stay in place.
+          patch(
+              "app/src/main/res/layout/activity_main.xml",
+              '            <!-- 横屏行为：默认自动收起，用户可切换为横屏也显示 -->',
+              '''            <!-- 完全离线的鲸鱼少女聊天与长期记忆 -->
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:background="@drawable/bg_card"
+                  android:orientation="vertical"
+                  android:padding="16dp">
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/companion_title"
+                      android:textColor="@color/text"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:text="@string/companion_hint"
+                      android:textColor="@color/text_dim"
+                      android:textSize="12sp" />
+                  <TextView
+                      android:id="@+id/btnCompanion"
+                      android:layout_width="match_parent"
+                      android:layout_height="44dp"
+                      android:layout_marginTop="10dp"
+                      android:background="@drawable/bg_btn_primary"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:gravity="center"
+                      android:text="@string/companion_open"
+                      android:textColor="#FFFFFF"
+                      android:textSize="14sp" />
+              </LinearLayout>
+
+              <!-- 横屏行为：默认自动收起，用户可切换为横屏也显示 -->''',
+              '@+id/btnCompanion',
+          )
+          patch(
+              "app/src/main/res/values/strings.xml",
+              '</resources>',
+              '''    <string name="companion_title">CETACEA_LOLI · 离线聊天与长期记忆</string>
+              <string name="companion_hint">不使用任何云端 API。聊天记录与明确告诉她的喜好/备忘保存在本机；每次聊天会参考记忆，角色保持鲸鱼少女、只讲简体中文、聪明懒散、傲娇又甜。</string>
+              <string name="companion_open">打开鲸鱼少女聊天</string>
+          </resources>''',
+              'name="companion_title"',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    private lateinit var btnProactive: TextView\n',
+              '    private lateinit var btnProactive: TextView\n    private lateinit var btnCompanion: TextView\n',
+              'private lateinit var btnCompanion',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '        btnProactive = findViewById(R.id.btnProactive)\n',
+              '        btnProactive = findViewById(R.id.btnProactive)\n        btnCompanion = findViewById(R.id.btnCompanion)\n',
+              'btnCompanion = findViewById',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/MainActivity.kt",
+              '    // 碎碎念开关\n',
+              '''        btnCompanion.setOnClickListener {
+                  startActivity(Intent(this, LocalCompanionActivity::class.java))
+                  Sfx.press()
+              }
+
+              // 碎碎念开关
+              ''',
+              'btnCompanion.setOnClickListener',
+          )
+          patch(
+              "app/src/main/AndroidManifest.xml",
+              '        <service\n            android:name=".PetService"',
+              '''        <activity
+              android:name=".LocalCompanionActivity"
+              android:exported="false"
+              android:label="@string/companion_title"
+              android:windowSoftInputMode="adjustResize" />
+
+          <service
+            android:name=".PetService"''',
+              'android:name=".LocalCompanionActivity"',
+          )
+
+          # The foreground chat panel must suppress overlay chatter while open.
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked())) return',
+              'if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked() || LocalCompanionMemory.isChatOpen(this))) return',
+              'LocalCompanionMemory.isChatOpen(this)',
+          )
+          patch(
+              "app/src/main/java/com/dshpet/android/PetService.kt",
+              'if (isScreenInteractiveUnlocked() && !landscapeHidden && menuView == null && !isQuietHours())',
+              'if (isScreenInteractiveUnlocked() && !landscapeHidden && menuView == null && !LocalCompanionMemory.isChatOpen(this) && !isQuietHours())',
+              'LocalCompanionMemory.isChatOpen(this) && !isQuietHours()',
+          )
+          # The chat panel owns the screen while open: suppress proactive and app-use overlays.
+          patch(
+              'app/src/main/java/com/dshpet/android/PetService.kt',
+              'if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null) return\n        maybeSendAppReminder(System.currentTimeMillis())',
+              'if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null || LocalCompanionMemory.isChatOpen(this)) return\n                  maybeSendAppReminder(System.currentTimeMillis())',
+              'LocalCompanionMemory.isChatOpen(this)) return\n        maybeSendAppReminder(System.currentTimeMillis())',
+          )
+          old_lines = '                    val lines = listOf(\n                        "主人～忙了好一阵啦，过来陪大肥鱼说句话嘛。",\n                        "哼，我才没有想你呢……只是提醒你休息一下。",\n                        "大肥鱼巡逻中！给我一点点注意力嘛～",\n                        "记得喝水和眨眨眼呀，我可不想主人累坏了。",\n                    )\n                    say(pet, lines.random())'
+          new_lines = '                    say(pet, LocalCompanionMemory.proactiveLine(this))'
+          pet_service = Path('app/src/main/java/com/dshpet/android/PetService.kt')
+          service_text = pet_service.read_text(encoding='utf-8')
+          if 'LocalCompanionMemory.proactiveLine(this)' not in service_text:
+              if old_lines not in service_text:
+                  raise SystemExit('Cannot connect proactive messages to local persona/memory; source block not found')
+              pet_service.write_text(service_text.replace(old_lines, new_lines, 1), encoding='utf-8')
+              print('Connected proactive bubble messages to CETACEA_LOLI persona and local memory.')
+          patch(
+              'app/src/main/java/com/dshpet/android/PetService.kt',
+              '    private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null) return',
+              '    private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null || LocalCompanionMemory.isChatOpen(this)) return',
+              'private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null || LocalCompanionMemory.isChatOpen(this)) return',
+          )
+          patch(
+              'app/src/main/java/com/dshpet/android/PetService.kt',
+              '        // 「让她说句话」：无论碎碎念开关如何都能用，顺手播一段带文字的动作',
+              '''        addRow("💗 跟鲸鱼少女聊聊") {
+                      dismissMenu()
+                      try {
+                          startActivity(Intent(this, LocalCompanionActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      } catch (t: Throwable) {
+                          Diag.record(this, "打开离线聊天面板失败", t)
+                      }
+                  }
+
+                  // 「让她说句话」：无论碎碎念开关如何都能用，顺手播一段带文字的动作''',
+              'LocalCompanionActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)',
+          )
+
+          # Bump version and extend CI assertions to make memory/chat presence mandatory.
+          gradle = Path('app/build.gradle.kts')
+          g = gradle.read_text(encoding='utf-8')
+          if 'versionName = "1.8.5"' not in g:
+              if 'versionCode = 15\n        versionName = "1.8.4"' not in g:
+                  raise SystemExit('Cannot bump combined build to 1.8.5')
+              g = g.replace('versionCode = 15\n        versionName = "1.8.4"',
+                            'versionCode = 16\n        versionName = "1.8.5"', 1)
+              gradle.write_text(g, encoding='utf-8')
+          print('Offline CETACEA_LOLI chat, persistent memory, persona-aware proactive speech and chat suppression applied.')
+          PY_LOCAL_COMPANION
+      - name: Make proactive bubbles clickable and auto-open chat keyboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CHAT_TOUCH'
+          from pathlib import Path
+          import re
+
+          service_path = Path('app/src/main/java/com/dshpet/android/PetService.kt')
+          service = service_path.read_text(encoding='utf-8')
+          start = service.find('    private fun say(pet: Pet, text: String')
+          end = service.find('    private fun placeBubble(', start)
+          if start < 0 or end < 0:
+              raise SystemExit('Cannot find PetService.say()/placeBubble() anchors')
+          block = service[start:end]
+          if 'openChat: Boolean = false' not in block:
+              block = block.replace(
+                  '    private fun say(pet: Pet, text: String) {',
+                  '    private fun say(pet: Pet, text: String, openChat: Boolean = false) {', 1,
+              )
+          if 'this.text = if (openChat)' not in block:
+              if '            this.text = text\n' not in block:
+                  raise SystemExit('Cannot locate bubble text assignment')
+              block = block.replace(
+                  '            this.text = text\n',
+                  '            this.text = if (openChat) "$text\\n· 点我聊天" else text\n', 1,
+              )
+          touch_flags = '''            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,'''
+          timeout_old = '            bubbleUntilMs = now + 3600L'
+          timeout_new = '            bubbleUntilMs = now + if (openChat) 9000L else 3600L'
+          if timeout_new not in block:
+              if timeout_old not in block:
+                  raise SystemExit('Cannot find bubble timeout anchor')
+              block = block.replace(timeout_old, timeout_new, 1)
+          touch_flags_new = '''            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          (if (openChat) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,'''
+          if 'if (openChat) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE' not in block:
+              if touch_flags not in block:
+                  raise SystemExit('Cannot locate bubble touch flags')
+              block = block.replace(touch_flags, touch_flags_new, 1)
+          if '点击主动气泡打开聊天失败' not in block:
+              anchor = '        box.addView(\n            tv,\n'
+              click_code = '''        if (openChat) {
+            val openChatListener = View.OnClickListener {
+                dismissBubble()
+                try {
+                    startActivity(
+                        Intent(this, LocalCompanionActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                } catch (t: Throwable) {
+                    Diag.record(this, "点击主动气泡打开聊天失败", t)
+                }
+            }
+            // Both the text card and its decorative tail enter chat.
+            box.isClickable = true
+            box.setOnClickListener(openChatListener)
+            tv.isClickable = true
+            tv.setOnClickListener(openChatListener)
+          }
+          box.addView(
+            tv,
+          '''
+              if anchor not in block:
+                  raise SystemExit('Cannot find bubble TextView insertion anchor')
+              block = block.replace(anchor, click_code, 1)
+          service = service[:start] + block + service[end:]
+          proactive_call = 'say(pet, LocalCompanionMemory.proactiveLine(this))'
+          if 'say(pet, LocalCompanionMemory.proactiveLine(this), openChat = true)' not in service:
+              if proactive_call not in service:
+                  raise SystemExit('Cannot find proactive companion bubble call')
+              service = service.replace(proactive_call, 'say(pet, LocalCompanionMemory.proactiveLine(this), openChat = true)', 1)
+          # App-use nudges are also invitations to continue chatting.
+          app_reminder_call = 'say(pet, message)'
+          if 'say(pet, message, openChat = true)' not in service:
+              if app_reminder_call not in service:
+                  raise SystemExit('Cannot find social-app reminder bubble call')
+              service = service.replace(app_reminder_call, 'say(pet, message, openChat = true)', 1)
+          service_path.write_text(service, encoding='utf-8')
+
+          activity_path = Path('app/src/main/java/com/dshpet/android/LocalCompanionActivity.kt')
+          activity = activity_path.read_text(encoding='utf-8')
+          if 'import android.view.inputmethod.InputMethodManager' not in activity:
+              anchor = 'import android.view.inputmethod.EditorInfo\n'
+              if anchor not in activity:
+                  raise SystemExit('Cannot locate chat activity input-method imports')
+              activity = activity.replace(anchor, anchor + 'import android.view.inputmethod.InputMethodManager\nimport android.view.WindowManager\n', 1)
+          if 'imm?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)' not in activity:
+              pattern = re.compile(r'(?m)^(?P<i>[ \t]*)setContentView\(root\)\n(?P=i)updateProactiveButton\(\)\n(?P=i)renderHistory\(\)$')
+              match = pattern.search(activity)
+              if not match:
+                  raise SystemExit('Cannot locate chat activity setContentView/initial render block')
+              i = match.group('i')
+              replacement = (
+                  f'{i}window.setSoftInputMode(\n'
+                  f'{i}    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or\n'
+                  f'{i}        WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE\n'
+                  f'{i})\n'
+                  f'{i}setContentView(root)\n'
+                  f'{i}updateProactiveButton()\n'
+                  f'{i}renderHistory()\n'
+                  f'{i}input.requestFocus()\n'
+                  f'{i}input.post {{\n'
+                  f'{i}    val imm = getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager\n'
+                  f'{i}    imm?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)\n'
+                  f'{i}}}'
+              )
+              activity = activity[:match.start()] + replacement + activity[match.end():]
+          activity_path.write_text(activity, encoding='utf-8')
+          print('Proactive bubbles are touchable and open the chat; chat launch requests the keyboard.')
+          PY_CHAT_TOUCH
+
+      - name: Guard companion chat layout parameters before compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTIVITY="app/src/main/java/com/dshpet/android/LocalCompanionActivity.kt"
+          test -s "$ACTIVITY"
+          grep -Eq '^[[:space:]]*import android.widget.FrameLayout$' "$ACTIVITY"
+          grep -Eq '^[[:space:]]*import android.view.ViewGroup$' "$ACTIVITY"
+          grep -Fq 'FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)' "$ACTIVITY"
+          if grep -q 'ScrollView.LayoutParams' "$ACTIVITY"; then
+            echo 'Invalid API: ScrollView.LayoutParams does not exist; use FrameLayout.LayoutParams.' >&2
+            exit 1
+          fi
+          echo 'LocalCompanionActivity layout-parameter references passed pre-build checks.'
+
+      - name: Harden birthday retry and launcher detection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_HARDEN'
+          from pathlib import Path
+
+          def patch(path, before, after, marker):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if marker in text:
+                  print(f"Already patched: {path}")
+                  return
+              if before not in text:
+                  raise SystemExit(f"Cannot patch {path}; source anchor not found: {before[:90]!r}")
+              p.write_text(text.replace(before, after, 1), encoding="utf-8")
+              print(f"Patched: {path}")
+
+          service = "app/src/main/java/com/dshpet/android/PetService.kt"
+
+          # If the phone is locked (or the pet hidden) when the birthday alarm fires, retry for up to 12 hours
+          # instead of silently dropping the celebration.
+          patch(
+              service,
+              'private var lastProactiveMs = 0L\n',
+              'private var lastProactiveMs = 0L\n    private var birthdayRetryUntilMs = 0L\n',
+              'private var birthdayRetryUntilMs = 0L',
+          )
+          patch(
+              service,
+              '    private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null || LocalCompanionMemory.isChatOpen(this)) return\n',
+              '    private fun birthdayCelebration() {\n        try {\n            if (!isScreenInteractiveUnlocked() || landscapeHidden || menuView != null || LocalCompanionMemory.isChatOpen(this)) {\n                // Locked screen or hidden pet right now: retry from the speech ticker.\n                if (birthdayRetryUntilMs == 0L) birthdayRetryUntilMs = System.currentTimeMillis() + 12L * 60L * 60L * 1000L\n                return\n            }\n            birthdayRetryUntilMs = 0L\n',
+              '// Locked screen or hidden pet right now: retry from the speech ticker.',
+          )
+          patch(
+              service,
+              'maybeSendAppReminder(System.currentTimeMillis())\n',
+              'maybeSendAppReminder(System.currentTimeMillis())\n        if (birthdayRetryUntilMs > 0L) {\n            if (System.currentTimeMillis() > birthdayRetryUntilMs) birthdayRetryUntilMs = 0L\n            else birthdayCelebration()\n        }\n',
+              'if (birthdayRetryUntilMs > 0L) {',
+          )
+
+          # Android 11+ package visibility: without this, resolving the HOME activity can return null, and the pets
+          # would be hidden even while the launcher is in front in landscape.
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
+          manifest = manifest_path.read_text(encoding="utf-8")
+          app_index = manifest.find("<application")
+          if app_index < 0:
+              raise SystemExit("Cannot find <application> in AndroidManifest.xml")
+          if "android.intent.category.HOME" in manifest[:app_index]:
+              print("Launcher package visibility already declared")
+          else:
+              line_start = manifest.rfind("\n", 0, app_index) + 1
+              queries = (
+                  "    <queries>\n"
+                  "        <intent>\n"
+                  '            <action android:name="android.intent.action.MAIN" />\n'
+                  '            <category android:name="android.intent.category.HOME" />\n'
+                  "        </intent>\n"
+                  "    </queries>\n\n"
+              )
+              manifest_path.write_text(manifest[:line_start] + queries + manifest[line_start:], encoding="utf-8")
+              print("Declared launcher package visibility for foreground-app detection")
+          PY_HARDEN
+
+      - name: Verify required art and animation files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/src/main/res/drawable-nodpi/whale_selfie.png
+          test -s app/src/main/res/drawable/whale_cutout.png
+          test -s app/src/main/assets/webp/a001.webp
+          test -s app/src/main/assets/webp/a106.webp
+          count=$(find app/src/main/assets/webp -maxdepth 1 -type f -name '*.webp' | wc -l)
+          test "$count" -eq 106
+          echo "Verified all $count animation files and original whale artwork."
+
+      - name: Generate missing sound resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/res/raw
+          python3 - <<'PY'
+          import math
+          import struct
+          import wave
+          from pathlib import Path
+
+          output = Path("app/src/main/res/raw")
+          output.mkdir(parents=True, exist_ok=True)
+
+          for name, frequency, duration in [
+              ("tap_press", 520, 0.05),
+              ("tap_release", 880, 0.06),
+          ]:
+              target = output / f"{name}.wav"
+              if target.exists():
+                  continue
+              rate = 22050
+              count = int(rate * duration)
+              frames = bytearray()
+              for i in range(count):
+                  t = i / rate
+                  envelope = math.exp(-65 * t) * (1 - i / count)
+                  sample = int(6500 * envelope * math.sin(2 * math.pi * frequency * t))
+                  frames.extend(struct.pack("<h", sample))
+              with wave.open(str(target), "wb") as wav:
+                  wav.setnchannels(1)
+                  wav.setsampwidth(2)
+                  wav.setframerate(rate)
+                  wav.writeframes(frames)
+              print(f"Created {target}")
+          PY
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace clean assembleDebug
+
+      - name: Verify APK integrity, signature and all custom features
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          # Old controls and interaction mechanics are mandatory: additions must not replace original functionality.
+          grep -q 'R.id.btnSound' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'R.id.btnPets' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnLinesEdit = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnLinesExport = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnLinesImport = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnLinesReload = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnKeepAlive = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnEdge = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'btnBubble = findViewById' app/src/main/java/com/dshpet/android/MainActivity.kt
+          grep -q 'private fun showActionMenu' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'private fun onPetTapped' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'private fun onPetThrown' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'fun tick(): Boolean' app/src/main/java/com/dshpet/android/Pet.kt
+          grep -q 'fun playAction(slug: String)' app/src/main/java/com/dshpet/android/Pet.kt
+          grep -q 'android:name=".BootReceiver"' app/src/main/AndroidManifest.xml
+          test -s app/src/main/assets/lines.json
+          grep -q 'const val MAX_PETS = 10' app/src/main/java/com/dshpet/android/Prefs.kt
+          grep -q 'landscapeVisibleOnLandscape' app/src/main/java/com/dshpet/android/Prefs.kt
+          grep -q 'android.permission.PACKAGE_USAGE_STATS' app/src/main/AndroidManifest.xml
+          grep -q 'proactiveOn' app/src/main/java/com/dshpet/android/Prefs.kt
+          grep -q 'DailyReminderScheduler' app/src/main/java/com/dshpet/android/DailyReminderScheduler.kt
+          grep -q 'maybeSendAppReminder' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'LocalCompanionMemory' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
+          grep -q 'btnCompanion' app/src/main/res/layout/activity_main.xml
+          grep -q 'LocalCompanionActivity' app/src/main/AndroidManifest.xml
+          grep -q 'openChat = true' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'showSoftInput(input' app/src/main/java/com/dshpet/android/LocalCompanionActivity.kt
+          grep -q 'FLAG_NOT_TOUCHABLE' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'if (openChat) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'say(pet, message, openChat = true)' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'android.permission.SCHEDULE_EXACT_ALARM' app/src/main/AndroidManifest.xml
+          grep -q 'android.intent.category.HOME' app/src/main/AndroidManifest.xml
+          grep -q 'birthdayRetryUntilMs' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'category != "summon" && (landscapeHidden' app/src/main/java/com/dshpet/android/PetService.kt
+          grep -q 'PERSONALITY_TSUNDERE_SWEET' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
+          grep -q 'fun removeMemory' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
+          grep -q 'fun clearHistory' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
+          grep -q 'android:dataExtractionRules="@xml/data_extraction_rules"' app/src/main/AndroidManifest.xml
+          grep -q 'cetacea_loli_local_v1.xml' app/src/main/res/xml/backup_rules.xml
+          grep -q 'val effectiveSizeDp = if (count > 1) minOf(sizeDp, fitLimitDp) else sizeDp' app/src/main/java/com/dshpet/android/PetService.kt
+          if grep -q 'android.permission.INTERNET' app/src/main/AndroidManifest.xml; then
+            echo 'Offline companion build must not request INTERNET permission.' >&2
+            exit 1
+          fi
+          test -s "$APK"
+          unzip -tq "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$APK"
+          python3 - <<'PY_VERIFY'
+          import zipfile
+          from pathlib import Path
+
+          apk = Path('app/build/outputs/apk/debug/app-debug.apk')
+          with zipfile.ZipFile(apk) as z:
+              names = set(z.namelist())
+              required = {
+                  'AndroidManifest.xml',
+                  'classes.dex',
+                  'assets/pet-config.json',
+                  'assets/lines.json',
+                  'assets/webp/a001.webp',
+                  'assets/webp/a103.webp',
+                  'assets/webp/a106.webp',
+                  'res/layout/activity_main.xml',
+                  'res/xml/backup_rules.xml',
+                  'res/xml/data_extraction_rules.xml',
+                  'resources.arsc',
+              }
+              missing = sorted(required - names)
+              if missing:
+                  raise SystemExit(f'APK missing required entries: {missing}')
+              animations = sorted(
+                  n for n in names if n.startswith('assets/webp/') and n.endswith('.webp')
+              )
+              expected = {f'assets/webp/a{i:03d}.webp' for i in range(1, 107)}
+              if set(animations) != expected:
+                  raise SystemExit(f'APK has {len(animations)} animations, expected 106')
+              dex = b''.join(z.read(n) for n in names if n.startswith('classes') and n.endswith('.dex'))
+              if b'BirthdaySchedule' not in dex or b'birthdayCelebration' not in dex:
+                  raise SystemExit('Birthday scheduler or celebration code is absent from DEX')
+              if b'landscapeVisibleOnLandscape' not in dex or b'updateLandscapeVisibility' not in dex:
+                  raise SystemExit('Landscape show/hide switch is absent from DEX')
+              if b'hasUsageAccess' not in dex or b'isHomeOrOwnAppForeground' not in dex:
+                  raise SystemExit('Foreground-app detection is absent from DEX')
+              if b'DailyReminderScheduler' not in dex:
+                  raise SystemExit('Midnight rest reminder class is absent from DEX')
+              if b'LocalCompanionMemory' not in dex or b'LocalCompanionActivity' not in dex:
+                  raise SystemExit('Offline chat or persistent local memory is absent from DEX')
+              if b'removeMemory' not in dex or b'clearHistory' not in dex or b'PERSONALITY_TSUNDERE_SWEET' not in dex:
+                  raise SystemExit('Local memory controls or full persona config is absent from DEX')
+              if b'maybeSendAppReminder' not in dex or b'isScreenInteractiveUnlocked' not in dex:
+                  raise SystemExit('Proactive companion or app reminder bytecode is absent from DEX')
+          print(f'APK verified: {apk.stat().st_size} bytes; 106 animations; birthday, landscape, proactive companion, offline chat and local-memory bytecode present.')
+          PY_VERIFY
+          mkdir -p build-delivery
+          cp "$APK" build-delivery/dsh-pet-full-v1.8.5.apk
+          (cd build-delivery && sha256sum dsh-pet-full-v1.8.5.apk | tee SHA256SUMS.txt)
+          cat > build-delivery/BUILD-INFO.txt <<'EOF'
+          App: 大肥鱼桌宠增强版（原装功能 + 生日 + 横屏 + 主动陪伴提醒）
+          Version: 1.8.5
+          Application ID: com.dshpet.android
+          Included: original settings, editable line library/import/export, click sound, touch/throw physics, edge-hide, keep-alive, original whale art and all 106 WebP animations; 1-10 pets; landscape auto-hide and return-to-home restore with Usage Access (orientation fallback otherwise), plus a separate keep-visible-in-landscape switch; birthday date/time, annual reminder, notification, greeting and celebration dance; local in-character proactive message about every 15 minutes, personality-aware rule-based offline chat with persistent local memory and chat history; quiet hours 22:00-08:00; supported social-app use reminders after 60 seconds with 45-minute global cooldown, 90-minute same-app cooldown and 5/day cap; midnight rest reminder notification.
+          Verification: APK ZIP integrity, Android APK signature, required resources, all 106 animations, and birthday/landscape/proactive-reminder bytecode verified in CI.
+          Runtime note: a successful CI build does not replace installation and behavior testing on the target phone. Android battery restrictions may delay reminders.
+          Signing note: this is debug-signed; if Android reports a signature conflict with an older installation, back up settings and uninstall the older version before installing this build.
+          EOF
+
+      - name: Upload APK and verification records
+        uses: actions/upload-artifact@v4
+        with:
+          name: bigfish-v1.8.5-offline-companion-apk
+          path: build-delivery/*
+          if-no-files-found: error
+          retention-days: 7
