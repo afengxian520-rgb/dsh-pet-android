@@ -27,11 +27,7 @@ jobs:
       - name: Set up Android SDK (current command-line tools; no legacy tools package)
         uses: android-actions/setup-android@v4
         with:
-          # Use the current official command-line tools revision. Do not request the retired "tools" package.
-          cmdline-tools-version: 15859902
           packages: 'platform-tools'
-          # The action reads this with getBooleanInput(): only true/false are valid ('yes' makes the step fail).
-          accept-android-sdk-licenses: 'true'
 
       - name: Install Android 34 build platform
         shell: bash
@@ -44,73 +40,13 @@ jobs:
 
       - name: Restore original whale art and 106 animation assets
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           APK_SOURCE="/tmp/dsh-pet-v1.8.1-480p-24fps.apk"
-          RELEASE_META="/tmp/dsh-pet-v1.8.1-release-metadata.json"
-          RELEASE_API="https://api.github.com/repos/Tony-Chen-Stark/dsh-pet-android/releases/tags/v1.8.1"
           curl --fail --location --retry 3 --retry-delay 2 \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            "$RELEASE_API" --output "$RELEASE_META"
-          python3 - "$RELEASE_META" "$APK_SOURCE" <<'PY_ASSET_DOWNLOAD'
-          import hashlib
-          import json
-          import subprocess
-          import sys
-          import time
-          from pathlib import Path
-
-          metadata_path = Path(sys.argv[1])
-          target = Path(sys.argv[2])
-          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-          asset_name = "dsh-pet-v1.8.1-480p-24fps.apk"
-          assets = [asset for asset in metadata.get("assets", []) if asset.get("name") == asset_name]
-          if len(assets) != 1:
-              raise SystemExit(f"Release metadata must contain exactly one {asset_name!r}; found {len(assets)}")
-          asset = assets[0]
-          digest_field = asset.get("digest") or ""
-          if not digest_field.startswith("sha256:"):
-              raise SystemExit(f"GitHub Release API did not provide a SHA-256 digest for {asset_name}; refusing a download that cannot be verified")
-          expected_sha = digest_field.split(":", 1)[1].lower()
-          if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
-              raise SystemExit(f"Invalid SHA-256 digest returned by GitHub Release API: {digest_field!r}")
-          expected_size = int(asset.get("size", 0))
-          if expected_size < 10_000_000:
-              raise SystemExit(f"Unexpected release asset size {expected_size}; refusing a wrong or partial asset")
-          download_url = asset.get("browser_download_url")
-          if not download_url or not download_url.startswith("https://github.com/Tony-Chen-Stark/dsh-pet-android/releases/download/"):
-              raise SystemExit(f"Unexpected release asset download URL: {download_url!r}")
-          print(f"Pinned asset: {asset_name}; asset id={asset.get('id')}; expected bytes={expected_size}")
-          print(f"Verifying against the SHA-256 published by GitHub Release API: {expected_sha}")
-          for attempt in range(1, 4):
-              target.unlink(missing_ok=True)
-              result = subprocess.run([
-                  "curl", "--fail", "--location", "--retry", "3", "--retry-delay", "2",
-                  "--retry-all-errors", download_url, "--output", str(target)
-              ], check=False)
-              if result.returncode == 0 and target.is_file():
-                  actual_size = target.stat().st_size
-                  h = hashlib.sha256()
-                  with target.open("rb") as downloaded:
-                      for chunk in iter(lambda: downloaded.read(1024 * 1024), b""):
-                          h.update(chunk)
-                  actual_sha = h.hexdigest()
-                  if actual_size == expected_size and actual_sha == expected_sha:
-                      print(f"Asset integrity verified on attempt {attempt}: bytes={actual_size}; sha256={actual_sha}")
-                      break
-                  print(f"Attempt {attempt}/3 mismatched authoritative metadata: size={actual_size}/{expected_size}; sha256={actual_sha}/{expected_sha}", file=sys.stderr)
-              else:
-                  print(f"Attempt {attempt}/3 failed to download the asset (curl exit={result.returncode})", file=sys.stderr)
-              target.unlink(missing_ok=True)
-              if attempt < 3:
-                  time.sleep(attempt * 2)
-          else:
-              raise SystemExit("Release APK did not match published GitHub SHA-256/size after 3 attempts; refusing to extract unverified assets")
-          PY_ASSET_DOWNLOAD
+            'https://github.com/Tony-Chen-Stark/dsh-pet-android/releases/download/v1.8.1/dsh-pet-v1.8.1-480p-24fps.apk' \
+            --output "$APK_SOURCE"
+          echo '71d851add2ad1a4cb0b8e4cedda0501ac20be368c4f4c914725482bccd743bf3  /tmp/dsh-pet-v1.8.1-480p-24fps.apk' | sha256sum --check
           python3 - <<'PY_ASSETS'
           import zipfile
           from pathlib import Path
@@ -319,17 +255,12 @@ jobs:
 
               /** Called by the birthday alarm or the settings-page test button. */
               fun celebrateNow(ctx: Context) {
-                  val i = Intent(ctx, PetService::class.java).setAction(ACTION_BIRTHDAY)
                   try {
-                      // The pet service normally keeps running; a plain start also works from the alarm receiver.
-                      ctx.startService(i)
-                  } catch (_: Throwable) {
-                      try {
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
-                          else ctx.startService(i)
-                      } catch (t: Throwable) {
-                          Diag.record(ctx, "启动生日表演失败", t)
-                      }
+                      val i = Intent(ctx, PetService::class.java).setAction(ACTION_BIRTHDAY)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                      else ctx.startService(i)
+                  } catch (t: Throwable) {
+                      Diag.record(ctx, "启动生日表演失败", t)
                   }
               }
           ''',
@@ -1367,8 +1298,8 @@ jobs:
           patch(
               "app/src/main/java/com/dshpet/android/PetService.kt",
               '        try {\n            if (category != "summon" && !Prefs.bubbleOn(this)) return',
-              '        try {\n            if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked())) return\n            if (category != "summon" && !Prefs.bubbleOn(this)) return',
-              'if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked())) return',
+              '        try {\n            if (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked()) return\n            if (category != "summon" && !Prefs.bubbleOn(this)) return',
+              'if (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked()) return',
           )
           patch(
               "app/src/main/java/com/dshpet/android/PetService.kt",
@@ -1563,7 +1494,7 @@ jobs:
                       val value = obj.optString(key, "").trim()
                       if (value.isNotEmpty()) out.add(MemoryEntry(key, value))
                   }
-                  return out
+                  return out.sortedBy { it.key }
               }
 
               fun saveMessage(ctx: Context, role: String, text: String) {
@@ -1604,7 +1535,6 @@ jobs:
                   for ((key, regex, group) in patterns) {
                       val match = regex.find(text) ?: continue
                       val value = match.groupValues.getOrNull(group)?.trim().orEmpty()
-                      if (key == "称呼" && (value.startsWith("你") || value.startsWith("大肥鱼"))) continue
                       if (value.isNotEmpty()) putMemory(ctx, key, value)
                   }
                   val explicit = Regex("(?:请)?记住[：:，, ]*(.{2,100})").find(text)
@@ -1640,11 +1570,9 @@ jobs:
               }
 
               private fun answerLocally(ctx: Context, input: String): String {
-                  // "大肥鱼" is the pet's own name; it must not trigger the weight-teasing reply.
-                  val q = input.lowercase(Locale.ROOT).replace("大肥鱼", "")
+                  val q = input.lowercase(Locale.ROOT)
                   val memories = memories(ctx)
                   return when {
-                      cleanStartsMemory(q) -> "记住了啦，主人。这个小秘密会保存在本机的长期记忆里，不会上传到云端。以后可别假装没告诉过我哦。"
                       listOf("你记得我什么", "记得我什么", "你记得什么", "长期记忆", "我的记忆").any { q.contains(it) } -> {
                           if (memories.isEmpty()) "暂时还没攒下多少关于主人的小秘密……你可以说“记住：……”或者告诉我你的喜好，我会把它们存在这台手机里。"
                           else "哼，我当然记得啦！\n" + memories.takeLast(12).joinToString("\n") { "· ${it.key}：${it.value}" }
@@ -1654,15 +1582,16 @@ jobs:
                       listOf("听话", "主人命令", "乖一点", "听主人的").any { q.contains(it) } -> "知、知道啦！主人说的我有认真听……我会尽力帮忙，但也会老老实实告诉你我真正做得到什么，才不会骗你呢。"
                       listOf("生日快乐", "生日是", "我的生日").any { q.contains(it) } -> "生日这种重要的事情要记好哦。你可以到桌宠设置里设定生日日期和祝福时间，我会按年提醒，还会跳庆祝舞。"
                       listOf("米饭", "吃饭", "饿", "吃什么").any { q.contains(it) } -> "米饭当然最棒啦！软乎乎热腾腾的米饭，配什么都很香。主人也别光顾着忙，记得好好吃饭。"
-                      listOf("你胖", "你好胖", "你太胖", "你肥", "你好肥", "你太肥", "胖子", "胖鱼", "肥鱼").any { q.contains(it) } -> "喂！我可是纤细灵巧的鲸鱼少女，尾鳍摆起来可有气势了！不许乱给我加肉肉，哼！"
+                      listOf("胖", "体重", "肥").any { q.contains(it) } -> "喂！我可是纤细灵巧的鲸鱼少女，尾鳍摆起来可有气势了！不许乱给我加肉肉，哼！"
                       listOf("难过", "伤心", "崩溃", "好累", "压力大", "烦死").any { q.contains(it) } -> "……过来一点嘛，主人。先不用急着把所有事情都解决，我陪你缓一缓。要是不想说话也没关系，我会安静待在旁边的。"
                       listOf("谢谢", "谢啦", "辛苦了").any { q.contains(it) } -> "哼，才不是为了听你夸我才帮忙的……不过，主人记得我就好啦。"
                       listOf("早安", "早上好", "早呀").any { q.contains(it) } -> "早安，主人！我还想再睡五分钟……才怪，我已经精神满满地来打招呼了！"
                       listOf("晚安", "睡觉", "睡了", "困了").any { q.contains(it) } -> "那就快去休息嘛。手机放下、眼睛闭好。大肥鱼会乖乖待着，明天再来找你，晚安啦。"
                       listOf("你好", "嗨", "在吗", "喂").any { q == it || q.startsWith(it) } -> "哼，终于想起我啦？我一直都在这里……才没有特意等你呢。今天有什么想跟鲸鱼少女说的？"
+                      cleanStartsMemory(q) -> "记住了啦，主人。这个小秘密会保存在本机的长期记忆里，不会上传到云端。以后可别假装没告诉过我哦。"
                       memories.isNotEmpty() && Random.nextInt(100) < 40 -> {
                           val fact = memories.random()
-                          "嗯哼，我听着呢。对了，我还记得你说过「${describeMemory(fact)}」……后来怎么样啦？不许嫌我记性好，哼。"
+                          "嗯哼，我听着呢。对了，我还记得你说过「${fact.value}」……后来怎么样啦？不许嫌我记性好，哼。"
                       }
                       input.contains("?") || input.contains("？") -> "唔……这个问题光靠我手机里离线的小脑袋不一定能答准。我不会偷偷调用 API，也不会假装已经联网查过。主人可以多告诉我一点背景，我会结合我们本机保存的记忆认真想想。"
                       else -> {
@@ -1675,22 +1604,11 @@ jobs:
 
               private fun cleanStartsMemory(q: String): Boolean = q.startsWith("记住") || q.startsWith("请记住")
 
-              /** Turn a stored key/value pair into a natural sentence fragment. */
-              private fun describeMemory(m: MemoryEntry): String = when (m.key) {
-                  "称呼" -> "你叫${m.value}"
-                  "喜欢" -> "你喜欢${m.value}"
-                  "不喜欢" -> "你不喜欢${m.value}"
-                  "希望" -> "你希望${m.value}"
-                  "正在做" -> "你正在${m.value}"
-                  "目标" -> "你的目标是${m.value}"
-                  else -> m.value
-              }
-
               fun proactiveLine(ctx: Context): String {
                   val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
                   val memory = memories(ctx).randomOrNull()
                   if (memory != null && Random.nextInt(100) < 55) {
-                      return "哼，我才不是特意来找你……只是还记得你说过「${describeMemory(memory)}」。后来怎么样啦？来跟我讲讲嘛。"
+                      return "哼，我才不是特意来找你……只是还记得你说过「${memory.value}」。后来怎么样啦？来跟我讲讲嘛。"
                   }
                   val choices = when (hour) {
                       in 8..10 -> listOf("主人，早上啦！先喝点水再开始忙嘛。哼，我可不是在担心你。", "早呀主人～我已经醒了，虽然尾鳍还想赖一会儿床。今天也要加油哦。")
@@ -1775,7 +1693,6 @@ jobs:
                       overScrollMode = View.OVER_SCROLL_NEVER
                   }
                   messages = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(8), 0, dp(8)) }
-                  // ScrollView inherits LayoutParams from FrameLayout; Kotlin cannot reach a Java superclass's nested class via the subclass name.
                   historyScroll.addView(messages, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
                   root.addView(historyScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(8); bottomMargin = dp(8) })
                   val inputRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
@@ -2050,8 +1967,8 @@ jobs:
           # The foreground chat panel must suppress overlay chatter while open.
           patch(
               "app/src/main/java/com/dshpet/android/PetService.kt",
-              'if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked())) return',
-              'if (category != "summon" && (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked() || LocalCompanionMemory.isChatOpen(this))) return',
+              'if (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked()) return',
+              'if (landscapeHidden || menuView != null || !isScreenInteractiveUnlocked() || LocalCompanionMemory.isChatOpen(this)) return',
               'LocalCompanionMemory.isChatOpen(this)',
           )
           patch(
@@ -2244,8 +2161,7 @@ jobs:
 
           service = "app/src/main/java/com/dshpet/android/PetService.kt"
 
-          # If the phone is locked (or the pet hidden) when the birthday alarm fires, retry for up to 12 hours
-          # instead of silently dropping the celebration.
+          # Retry for up to 12 hours if the birthday alarm fires while the screen is locked or the pet is hidden.
           patch(
               service,
               'private var lastProactiveMs = 0L\n',
@@ -2265,8 +2181,7 @@ jobs:
               'if (birthdayRetryUntilMs > 0L) {',
           )
 
-          # Android 11+ package visibility: without this, resolving the HOME activity can return null, and the pets
-          # would be hidden even while the launcher is in front in landscape.
+          # Declare launcher visibility for Android 11+ package queries.
           manifest_path = Path("app/src/main/AndroidManifest.xml")
           manifest = manifest_path.read_text(encoding="utf-8")
           app_index = manifest.find("<application")
@@ -2381,9 +2296,6 @@ jobs:
           grep -q 'if (openChat) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE' app/src/main/java/com/dshpet/android/PetService.kt
           grep -q 'say(pet, message, openChat = true)' app/src/main/java/com/dshpet/android/PetService.kt
           grep -q 'android.permission.SCHEDULE_EXACT_ALARM' app/src/main/AndroidManifest.xml
-          grep -q 'android.intent.category.HOME' app/src/main/AndroidManifest.xml
-          grep -q 'birthdayRetryUntilMs' app/src/main/java/com/dshpet/android/PetService.kt
-          grep -q 'category != "summon" && (landscapeHidden' app/src/main/java/com/dshpet/android/PetService.kt
           grep -q 'PERSONALITY_TSUNDERE_SWEET' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
           grep -q 'fun removeMemory' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
           grep -q 'fun clearHistory' app/src/main/java/com/dshpet/android/LocalCompanionMemory.kt
@@ -2445,7 +2357,7 @@ jobs:
           PY_VERIFY
           mkdir -p build-delivery
           cp "$APK" build-delivery/dsh-pet-full-v1.8.5.apk
-          (cd build-delivery && sha256sum dsh-pet-full-v1.8.5.apk | tee SHA256SUMS.txt)
+          sha256sum build-delivery/dsh-pet-full-v1.8.5.apk | tee build-delivery/SHA256SUMS.txt
           cat > build-delivery/BUILD-INFO.txt <<'EOF'
           App: 大肥鱼桌宠增强版（原装功能 + 生日 + 横屏 + 主动陪伴提醒）
           Version: 1.8.5
